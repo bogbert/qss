@@ -1,0 +1,1496 @@
+#! /usr/bin/env ruby
+# coding: utf-8
+
+# QSS - Quick SSM Session
+# https://github.com/bogbert/qss
+#
+# This script helps manage and connect to EC2 instances via AWS Systems Manager (SSM).
+# It's designed for users working with multiple environments spread across several
+# AWS accounts and regions. QSS maintains a local database of instances, indexed by
+# account, environment, and short name for quick access.
+# QSS leverages bash completion to streamline command entry, displaying available options
+# for accounts, environments, and instance names.
+#
+# Main features:
+#   - Connect to EC2 instances via SSM with a simple command line interface
+#   - Support bash completion for command-line arguments
+#   - Update the local instance database (option --refresh)
+#   - List instances from the database (option --list)
+#   - Display detailed information about instances (option --info)
+#
+# Prerequisites:
+#   - Ruby 2.4 or higher
+#     A Ruby version supporting recent releases of the 'aws-sdk-ec2' gem is recommended
+#     for compatibility and security
+#   - Ruby gems:
+#     - aws-sdk-ec2 (for EC2 instance interactions)
+#     - json-schema (for configuration validation)
+#   - AWS CLI installed and configured
+#   - Session Manager plugin for AWS CLI
+#   - AWS API access with permissions to list EC2 instances and establish SSM sessions
+#
+# Configuration:
+#   - Managed via a JSON file (default: ~/.qss.json)
+#   - Instance database stored in a JSON file (default: ~/.qss.db)
+#
+# Conventions:
+#   - Account names, environment names, and instance short names are expected to be in lowercase
+#   - Naming templates support automatic extraction of environments and short names from instance names
+#
+# Usage examples:
+#   qss dev staging app-server      # Connect to the specified instance via SSM
+#   qss --refresh                   # Refresh the entire database
+#   qss --refresh dev               # Refresh only the 'dev' account
+#   qss --list dev                  # List instances in the 'dev' account
+#   qss --info dev staging          # Show detailed info about 'dev/staging' instances
+
+# Copyright (c) 2025 Pierre G. Bogossian
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+require 'json'
+require 'json-schema'
+require 'aws-sdk-ec2'
+require 'getoptlong'
+require 'erb'
+require 'ostruct'
+
+##########################################################################
+
+def usage(rc = 0)
+    me = File.basename($0)
+    output = (rc == 0) ? $stdout : $stderr
+
+    output.puts %Q{\
+.
+. QSS - Quick SSM Session v1.0
+. Usage: #{me} [options] <account> <env name> <instance short name>
+.        #{me} --refresh [options] [<account> [<env name>]]
+.        #{me} --list    [options] [<account> [<env name>]]
+.        #{me} --info    [options] [<account> [<env name> [<instance short name>]]]
+.        #{me} --install-completion
+.
+. Options --refresh, --list, --info and --install-completion are actually
+. commands in disguise, if none of them is specified, the script will try
+. to connect to the instance which is the main purpose of this script.
+.
+. Note: If a default_account is configured in the configuration file,
+.       the <account> parameter has to be omitted for all commands.
+.       You can still override the default account with the --account/-a option.
+.
+. Options:
+.   -r, --refresh         Refresh the instance database
+.   -l, --list            List content of the instance database
+.   -i, --info            Display information about instances
+.   -R, --group_by_region Group instances by account/region/env (use with --list and --info)
+.   -E, --group_by_env    Group instances by account/env/region (use with --list and --info)
+.   --install-completion  Install bash completion script
+.   -a, --account         Specify account (overrides default_account from config)
+.   -v, --verbose         Enable verbose mode
+.   -y, --yes             Automatically agree to all yes/no questions
+.   -h, --help            Display this help message
+.   -c, --config          Specify the configuration file (default: ~/.qss.json)
+.
+. Examples:
+.   # Without default_account configured:
+.   #{me} dev staging app-server      # Connect to instance
+.   #{me} --list dev                  # List instances in dev account
+.
+.   # With default_account configured (e.g., "dev"):
+.   #{me} staging app-server          # Connect using default account
+.   #{me} --list                      # List instances in default account
+.   #{me} -a prod staging app-server  # Override default, use prod account
+.
+}
+
+    exit(rc)
+end
+
+##########################################################################
+
+# Example of a valid configuration file:
+# NB: use lowercase for account and env names
+# {
+#     "default_env": "noenv",
+#     "default_regions": ["eu-west-3"],
+#     "default_templates": ["std_env"],
+#     "accounts": {
+#         "dev": {
+#             "aws_profile": "default"
+#         },
+#         "prod": {
+#             "aws_profile": "prod",
+#             "ignore": true,
+#             "regions": ["eu-west-1", "eu-west-3"]
+#         }
+#     },
+#     "naming_templates": {
+#         "std_env": {
+#             "regex": "^[^-]*-(.*)-([^-]*)$",
+#             "env": 1,
+#             "inst": 2
+#         }
+#     }
+# }
+
+def validate_config(config)
+    ## The schema of the configuration file
+    config_schema = {
+        "type" => "object",
+        "properties" => {
+            ## The default environment name to use if not specified in the template definition
+            ## It's also the environment name used if the instance name does not match any template
+            ## Specify an empty string so that the instances are not indexed
+            "default_env" => {"type" => "string"},
+            ## The default regions to use if not specified in the account definition
+            "default_regions" => {
+                "type" => "array",
+                "items" => { "type" => "string" }
+            },
+            ## The default templates to use if not specified in the account definition
+            "default_templates" => {
+                "type" => "array",
+                "items" => { "type" => "string" }
+            },
+            ## Users who tend to use the same account most of the time can specify a default account
+            ## They won't have to specify the account name on the command line
+            ## If they ever want to use another account, they can specify it with the --account/-a option
+            "default_account" => {
+                "type" => "string",
+                "pattern" => "^[^[:upper:]]*$"
+            },
+            ## If true, the instances are grouped by account/region/env, otherwise by account/env/region
+            ## in the output of the --list and --info commands
+            "group_by_region" => {"type" => "boolean"},
+            "db_filepath" => {"type" => "string"},
+            ## The command to use to connect to the instance
+            ## The command is an array of strings, each string is an ERB template
+            ## The following variables are available in the templates:
+            ## account, profile, region, az, env, short_name, instance_id, instance_name, ec2_instance
+            "connect_command" => {
+                "type" => "array",
+                "minItems" => 1,
+                "items" => {
+                    "type" => "string"
+                }
+            },
+            ## The environment variables to set before executing the connect command
+            ## The variables are ERB templates, the following variables are available in the templates:
+            ## account, profile, region, az, env, short_name, instance_id, instance_name, ec2_instance
+            "connect_env_vars" => {
+                "type" => "object",
+                "patternProperties" => {
+                    ".+" => {
+                        "type" => "string"
+                    }
+                },
+                "additionalProperties" => false
+            },
+            "accounts" => {
+                "type" => "object",
+                "patternProperties" => {
+                    "^[^[:upper:]]+$" => {
+                        "type" => "object",
+                        "properties" => {
+                            "aws_profile" => { "type" => "string" },
+                            ## ignored accounts are not processed by :refresh, :list and :info modes
+                            ## unless the account is explicitly specified on the command line
+                            ## This is useful for accounts the user is only granted occasional access to (such as prod)
+                            "ignore" => { "type" => "boolean" },
+                            ## The regions to scan for this account
+                            "regions" => {
+                                "type" => "array",
+                                "items" => { "type" => "string" }
+                            },
+                            ## The templates to apply to the instance names of this account
+                            ## to extract the environment name and instance short name
+                            ## Templates are applied in the order they are defined, the first match is used
+                            "templates" => {
+                                "type" => "array",
+                                "items" => { "type" => "string" }
+                            }
+                        },
+                        "required": ["aws_profile"]
+                    }
+                },
+                "additionalProperties" => false
+            },
+            "naming_templates" => {
+                "type" => "object",
+                "patternProperties" => {
+                    ".+" => {
+                        "type" => "object",
+                        "properties" => {
+                            "regex" => { "type" => "string" },
+                            ## The env and inst properties define the environment name and instance short name used on command line
+                            ## Their values can be either an integer or a string:
+                            ## . an integer is an index in the regex match
+                            ## . a string is an ERB template that can use the following variables: match, account, region, inst_name
+                            ##   example: "<%= match[1] %>.<%= region %>"
+                            ## The matching instance is not indexed if either env or inst is an empty string
+                            "env" => { "type" => ["integer", "string"] },
+                            "inst" => { "type" => ["integer", "string"] }
+                        },
+                        "required": ["regex"]
+                    }
+                },
+                "additionalProperties" => false
+            }
+        }
+    }
+
+    JSON::Validator.validate!(config_schema, config, :clear_cache => true)
+end
+
+##########################################################################
+
+def read_config_file(config_filepath, defaults)
+    config_filepath = File.expand_path(config_filepath)
+
+    puts "Loading configuration file: #{config_filepath}" if $VERBOSE
+    config_raw = File.read(config_filepath)
+    config = JSON.parse(config_raw)
+    validate_config(config)
+
+    ## Build the configuration hash
+    {
+        default_env:        config['default_env'] || defaults[:default_env],
+        default_regions:    config['default_regions'] || defaults[:default_regions],
+        group_by_region:    config['group_by_region'].nil? ? defaults[:group_by_region] : config['group_by_region'],
+        default_templates:  config['default_templates'] || [],
+        default_account:    config['default_account'],
+        db_filepath:        File.expand_path(expand_env(config['db_filepath'] || defaults[:db_filepath])),
+        all_accounts:       config['accounts'] || {},
+        naming_templates:   config['naming_templates'] || {},
+        connect_command:    config['connect_command'] || defaults[:connect_command],
+        connect_env_vars:   config['connect_env_vars'] || defaults[:connect_env_vars],
+    }
+
+rescue Errno::ENOENT
+    exit_on_error("Configuration file not found: #{config_filepath}", 2)
+rescue SystemCallError => e # Other file-related errors (e.g., permissions)
+    exit_on_error("Error reading configuration file: #{config_filepath}\nError: #{e.message}", 3)
+rescue JSON::ParserError => e
+    exit_on_error("Invalid JSON in configuration file: #{config_filepath}\nError: #{e.message}", 4)
+rescue JSON::Schema::ValidationError => e
+    exit_on_error("Configuration file does not match schema: #{config_filepath}\nDetails: #{e.message}", 5)
+end
+
+##########################################################################
+
+def exit_on_error(error, rc)
+    $stderr.puts "ERROR - #{error}"
+    exit(rc)
+end
+
+##########################################################################
+
+# Return a default value (nil by default) if the value is nil or empty.
+def default(value, default = nil)
+    return default if value.nil? || value.empty?
+    value
+end
+
+##########################################################################
+
+def expand_env(str)
+    ## This regex substitutes $VAR, ${VAR} and %VAR% (Windows-style)
+    str.gsub(/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/) { ENV[$1] }
+end
+
+##########################################################################
+
+# Validate a regex pattern
+# Return nil if valid, otherwise return an error message
+def validate_regex(pattern)
+    Regexp.new(pattern)
+    nil
+rescue RegexpError => e
+    e.message
+end
+
+##########################################################################
+
+def load_database_file(db_filepath, db_version = nil)
+    db_filepath = File.expand_path(db_filepath)
+    puts "Loading the database file: #{db_filepath}" if $VERBOSE
+    db_raw = File.read(db_filepath)
+    db = JSON.parse(db_raw)
+    if db_version && db['version'] != db_version
+        $stderr.puts "Warning - Database version mismatch: expected #{db_version}, got #{db['version'] || '<no version>'}" if $VERBOSE
+    end
+
+    return db
+end
+
+##########################################################################
+
+## Filter the database according to provided account / env / instance
+## Ignored accounts are removed, unless for the filtered account
+def filter_database(db_accounts, config, account = nil, env = nil, instance = nil)
+    ## Filter by account if specified
+    if account
+        raise("Account '#{account}' not found in database") unless db_accounts[account]
+        account_data = db_accounts[account].dup
+
+        ## Filter by environment if specified
+        if env
+            account_data = account_data.select{ |region, reg_data| reg_data[env] }.transform_values{ |reg_data| {env => reg_data[env]} }
+            raise("Environment '#{env}' not found in account '#{account}'") if account_data.empty?
+
+            ## Filter by instance short name if specified
+            if instance
+                account_data = account_data.select{ |region, reg_data| reg_data[env][instance] }
+                raise("Instance '#{instance}' not found in environment '#{account} / #{env}'") if account_data.empty?
+                account_data = account_data.transform_values{ |reg_data| {env => {instance => reg_data[env][instance]}} }
+            end
+        end
+        return {account => account_data}
+    else
+        return db_accounts.reject{ |acc, _| config[:all_accounts] && config[:all_accounts][acc] && config[:all_accounts][acc]['ignore'] }
+    end
+end
+
+##########################################################################
+
+def read_user_input
+    return STDIN.gets.strip
+rescue Interrupt
+    puts "\nAborted by user"
+    exit 6
+end
+
+##########################################################################
+
+def ask_for_yes_no(msg, auto_yes = false, default = true)
+    full_msg = "#{msg} #{default ? '[Y/n]' : '[y/N]'} "
+    user_response = nil
+    loop do
+        print full_msg
+        if auto_yes
+            puts "(auto-yes)"
+            return true
+        end
+        user_response = read_user_input.downcase
+        puts
+        return default if user_response.empty? && !default.nil?
+        break if user_response =~ /^(y(es)?|n(o)?)$/i
+        puts "You answered '#{user_response}' and it is not clear if that was supposed to be a yes or a no, let's try again."
+    end
+    return !(user_response =~ /^n/i)
+end
+
+##########################################################################
+
+def extract_info_from_inst_name(default_env, account, region, az, name, templates)
+    env = short_name = nil
+    templates.each do |tplt|
+        res = name.match(tplt['regex'])
+        if res
+            env_cfg = tplt['env'] || default_env
+            inst_cfg = tplt['inst'] || '<%= inst_name %>'
+            erb_vars = {match: res, account: account, region: region, az: az, inst_name: name}
+
+            env = env_cfg.is_a?(Integer) ? res[env_cfg] : erb_eval(env_cfg, erb_vars)
+            short_name = inst_cfg.is_a?(Integer) ? res[inst_cfg] : erb_eval(inst_cfg, erb_vars)
+
+            break # Exit loop once a template matches
+        end
+    end
+
+    return [(env || default_env).downcase, (short_name || name).downcase]
+end
+
+##########################################################################
+
+def get_binding_from_hash(h)
+    OpenStruct.new(h).instance_eval{ binding }
+end
+
+##########################################################################
+
+def erb_eval(template, variables = {})
+  ERB.new(template, trim_mode: '-').result(get_binding_from_hash(variables))
+rescue SyntaxError => e
+  raise "Invalid ERB template: #{e.message}"
+rescue => e
+  raise "ERB evaluation failed: #{e.message}"
+end
+
+##########################################################################
+
+def swap_region_env_levels(region_hash)
+  region_hash.each_with_object({}) do |(region, reg_data), env_hash|
+    reg_data.each do |env, short_names|
+      # Initialize the environment hash if needed
+      env_hash[env] ||= {}
+      # Assign the short_names directly to the corresponding region
+      env_hash[env][region] = short_names
+    end
+  end
+end
+
+##########################################################################
+
+def truncate_text(text, max_width)
+    return text if text.length <= max_width
+    "#{text[0, max_width - 3]}..."
+end
+
+##########################################################################
+
+def build_table_row_str(row, col_widths, sep)
+    col_widths.each_with_index.with_object([]) do |(width, i), result|
+        result << truncate_text((row[i] || '').to_s, width).ljust(width)
+    end.join(sep)
+end
+
+##########################################################################
+
+## Recursive function to build a table from a hash, meant to be used with display_hash_as_table
+## The function builds a table of a given number of columns from a nested hash
+## Arrays are supported but each element of the array is considered a final cell value (no array nesting)
+## Call it like that:
+## table = hash_to_table(data, column_number)
+## Notice that for an empty hash, the resulting table will contain one empty row
+def hash_to_table(data, col_number, depth = 0, prev_cols = [], table = [])
+    if data.nil? || data.empty?
+        ## Fill the rest of the row with empty cells
+        table << (prev_cols + [''] * (col_number - depth))
+        return table
+    end
+
+    col_padding = [''] * depth if data.size > 1
+
+    ## Last column reached, add rows to the table
+    if depth + 1 == col_number
+        data.sort.each_with_index do |(key, _), i|
+            cur_prev_cols = (i == 0) ? prev_cols : col_padding
+            table << (cur_prev_cols + [key.to_s])
+        end
+        return table
+    end
+
+    ## For other columns, build rows up to the current column and do recusrive
+    ## call to handle the next column
+    data.sort.each_with_index do |(key, child_data), i|
+        cur_prev_cols = (i == 0) ? prev_cols : col_padding
+        hash_to_table(child_data, col_number, depth + 1, cur_prev_cols + [key.to_s], table)
+    end
+    return table
+end
+
+##########################################################################
+
+## data is a hash, containing nested hashes, the depth of the nesting
+## has to be bigger or equal to the number of columns
+## For the last column, arrays are accepted instead of hashes
+## columns format: [[<column name>, <column max width>], ...]
+def display_table(table, columns, col_separator = ' | ')
+    ## Extract column names and widths
+    col_number = columns.size
+    col_names = columns.map{ |c| c[0] }
+    col_min_widths = col_names.map(&:length)
+    col_max_widths = columns.map{ |c| c[1] }
+
+    ## Compute column actual widths + total table width
+    col_widths = (0...col_number).map do |col|
+        [(table.map{ |row| row[col].to_s.length } << col_min_widths[col]).max, col_max_widths[col]].min
+    end
+    table_width = col_widths.sum + col_separator.length * (col_number - 1)
+    horiz_separator = '-' * table_width
+
+    ## Print the table
+    puts horiz_separator
+    puts build_table_row_str(col_names, col_widths, col_separator)
+    puts horiz_separator
+    table.each{ |row| puts build_table_row_str(row, col_widths, col_separator) }
+    puts horiz_separator
+end
+
+##########################################################################
+
+## Search for EC2 instances in a specific account and region
+## It is possible to search for a list of instance names
+## Terminated instances are not included in the search
+def fetch_ec2_instances(account_name, region, config, instance_names = nil, batch_size = 500)
+    raise "Account '#{account_name}' not found in configuration" unless config[:all_accounts][account_name]
+
+    ## If aws_profile is an empty string, no profile will be used
+    ## This can be useful for example if qss is ran from an instance with a proper IAM role
+    ec2_config = {region: region}
+    ec2_config[:profile] = config[:all_accounts][account_name]['aws_profile'] unless config[:all_accounts][account_name]['aws_profile'].empty?
+    ec2 = Aws::EC2::Resource.new(ec2_config)
+
+    base_filters = [ { name: 'instance-state-name', values: ['pending', 'running', 'shutting-down', 'stopping', 'stopped'] } ]
+
+    # If no instance names are provided, return all instances
+    return ec2.instances(filters: base_filters).to_a if instance_names.nil? || instance_names.empty?
+
+    all_instances = []
+    instance_names.each_slice(batch_size) do |batch|
+        filters = base_filters + [{ name: 'tag:Name', values: batch }]
+        batch_instances = ec2.instances(filters: filters)
+        all_instances.concat(batch_instances.to_a)
+    end
+
+    return all_instances
+end
+
+##########################################################################
+
+## Input: accounts hash with structure:
+##   {account_name => {region => {env_name => {short_name => [instance_names]}}}}
+##
+## Output: hash with structure:
+##   {[account_name, region] => [:success, {instance_name => [instances]}] or [:error, error]}
+def fetch_ec2_inst_from_db_accounts(accounts, config, max_thread_num = 20)
+    instance_info = {}
+
+    ## Build the list of account/region pairs to process + instance names
+    reg_to_process = accounts.flat_map do |acc, acc_data|
+        acc_data.map do |reg, reg_data|
+            instance_names = reg_data.values.flat_map(&:values).flatten.compact.uniq
+            if instance_names.empty?
+                instance_info[[acc, reg]] = [:success, {}]
+                next nil
+            end
+            [acc, reg, instance_names]
+        end.compact
+    end
+    reg_num = reg_to_process.size
+
+    ## Fetch the instance info from EC2
+    ## Threads are used to parallelize API calls, with each thread processing one account/region pair at a time
+    next_reg_index = 0
+    thread_list = []
+    mutex = Mutex.new
+    [max_thread_num, reg_num].min.times do
+        thread_list << Thread.new do
+            loop do
+                reg_index = nil
+                mutex.synchronize do
+                    reg_index = next_reg_index
+                    next_reg_index += 1
+                end
+                break if reg_index >= reg_num
+                (acc, reg, instance_names) = reg_to_process[reg_index]
+
+                begin
+                    instances_by_name = fetch_ec2_instances(acc, reg, config, instance_names).group_by do |i|
+                        name = i.tags.find{ |t| t.key == 'Name' }&.value
+                    end
+                    result = [:success, instances_by_name]
+                rescue => error
+                    result = [:error, error]
+                end
+
+                mutex.synchronize do
+                    instance_info[[acc, reg]] = result
+                end
+            end
+        end
+    end
+    thread_list.each{ |t| t.join }
+
+    return instance_info
+end
+
+##########################################################################
+################### Main
+
+$verbose            = false
+
+DATABASE_VERSION    = 1
+MAX_THREAD_NUM      = 20
+
+mode                = :connect
+valid_argc          = [3]
+mode_counter        = 0
+group_by_region_opt = nil
+account_opt         = nil
+auto_yes            = false
+config_filepath     = '~/.qss.json'
+std_script_name     = 'qss'
+
+completion_dir_var  = 'BASH_COMPLETION_USER_DIR'
+completion_dirs     = [
+    '~/.local/share/bash-completion/completions',
+    '~/.config/bash-completion/completions',
+    '~/.bash-completion/completions',
+    '~/.bash_completion.d',
+]
+
+config_defaults = {
+    default_env:      '.',
+    default_regions:  ['us-east-1'],
+    group_by_region:  false,
+    db_filepath:      '~/.qss.db',
+    connect_command:  ['aws', '--profile', '<%= profile %>', '--region', '<%= region %>', 'ssm', 'start-session', '--target', '<%= instance_id %>'],
+    connect_env_vars: {}
+}
+
+begin
+    opts = ::GetoptLong.new(
+        [ '--refresh',         '-r', ::GetoptLong::NO_ARGUMENT ],
+        [ '--list',            '-l', ::GetoptLong::NO_ARGUMENT ],
+        [ '--info',            '-i', ::GetoptLong::NO_ARGUMENT ],
+        [ '--install-completion',    ::GetoptLong::NO_ARGUMENT ],
+        [ '--group_by_region', '-R', ::GetoptLong::NO_ARGUMENT ],
+        [ '--group_by_env',    '-E', ::GetoptLong::NO_ARGUMENT ],
+        [ '--verbose',         '-v', ::GetoptLong::NO_ARGUMENT ],
+        [ '--yes',             '-y', ::GetoptLong::NO_ARGUMENT ],
+        [ '--help',            '-h', ::GetoptLong::NO_ARGUMENT ],
+        [ '--account',         '-a', ::GetoptLong::REQUIRED_ARGUMENT ],
+        [ '--config',          '-c', ::GetoptLong::REQUIRED_ARGUMENT ]
+    )
+    opts.quiet = true  ## We don't want GetoptLong to display the error, we do it in the "rescue"
+
+    opts.each do |opt, arg|
+        case opt
+        when '--refresh'            then mode = :refresh
+                                         valid_argc = [0, 1, 2]
+                                         mode_counter += 1
+        when '--list'               then mode = :list
+                                         valid_argc = [0, 1, 2]
+                                         mode_counter += 1
+        when '--info'               then mode = :info
+                                         valid_argc = [0, 1, 2, 3]
+                                         mode_counter += 1
+        when '--install-completion' then mode = :install_completion
+                                         valid_argc = [0]
+                                         mode_counter += 1
+        when '--group_by_region'    then group_by_region_opt = true
+        when '--group_by_env'       then group_by_region_opt = false
+        ## Repeat the --verbose option twice to enable debug-level verbosity
+        when '--verbose'            then $VERBOSE = true if $verbose # $VERBOSE = nil by default
+                                         $verbose = true
+        when '--yes'                then auto_yes = true
+        when '--help'               then usage
+        when '--config'             then config_filepath = default(arg, config_filepath)
+        when '--account'            then account_opt = arg
+        end
+    end
+
+    raise "Options --refresh, --list, --info and --install-completion are mutually exclusive" if mode_counter > 1
+
+    ## We have to read the config file before checking the number of arguments as the
+    ## presence of a default account can change the expected number of arguments
+    ## We don't want to trigger an error now if the config file is not valid
+    begin
+        config = read_config_file(config_filepath, config_defaults)
+    rescue => config_error
+        config = {}
+    end
+
+    account_name = default(account_opt || config[:default_account])
+    valid_argc = valid_argc.map{ |argc| [argc - 1, 0].max } if account_name
+    raise "Wrong argument number" unless valid_argc.include?(ARGV.size)
+
+    account  = (account_name || ARGV.shift)&.downcase
+    env      = ARGV[0]&.downcase
+    instance = ARGV[1]&.downcase
+
+    raise "Invalid environment name" if env && env.empty?
+    raise "Invalid instance name" if instance && instance.empty?
+rescue => error
+    $stderr.puts "ERROR - Command line error: #{error}"
+    usage(1)
+end
+
+raise config_error if config_error
+
+################### Refresh the instance database
+if mode == :refresh
+    ## Check if the default account points to a valid account
+    if default(config[:default_account]) && !config[:all_accounts][config[:default_account]]
+        $stderr.puts "Warning - The configured default account points to an account '#{config[:default_account]}' that does not exist in the configuration file"
+    end
+
+    ## Check template references
+    all_tplt_refs = (config[:all_accounts].map{ |acc, prop| prop['templates'] || [] } + config[:default_templates]).flatten.uniq
+    missing_tplts = all_tplt_refs.reject{ |tplt_name| config[:naming_templates][tplt_name] }
+    $stderr.puts "Warning - The following template(s) are referenced but do not exist, they will be ignored: #{missing_tplts.join(', ')}" unless missing_tplts.empty?
+
+    ## Check the template regexes
+    config[:naming_templates].each do |tplt_name, tplt|
+        regex_error = validate_regex(tplt['regex'])
+        if regex_error
+            $stderr.puts "Warning - Invalid regex in template '#{tplt_name}', this template will be ignored: #{regex_error}"
+            config[:naming_templates].delete(tplt_name)
+        end
+    end
+
+    ## Load the db file if it exists
+    old_db = {}
+    if File.exist?(config[:db_filepath])
+        begin
+            ## Read the old db
+            old_db = load_database_file(config[:db_filepath], DATABASE_VERSION)
+        rescue => error
+            $stderr.puts "Warning - Database file '#{config[:db_filepath]}' cannot be read or is invalid: #{error}" if $verbose
+            if account
+                ## Prompt the user in case of error (unless he does a full refresh)
+                puts "The database file '#{config[:db_filepath]}' cannot be read"
+                puts "We will have to start from an empty database"
+                exit unless ask_for_yes_no('Continue ?', auto_yes)
+            end
+        end
+    end
+    old_db_accounts = old_db['accounts'] || {}
+
+    ## Prepare the new db hash and build the list of account/region pairs to process
+    if account
+        if !old_db.empty? && DATABASE_VERSION != old_db['version']
+            puts "The current database has been created by a different version of the script, its compatibility is not guaranteed"
+            puts "We recommend you perform a full refresh of the database, i.e. call the --refresh option without any account or environment"
+            exit 20 unless ask_for_yes_no('Do you want to continue anyway ?', auto_yes, false)
+        end
+
+        ## Check if the account is present in the configuration file
+        if config[:all_accounts][account]
+            accounts_to_process = {account => config[:all_accounts][account]}
+        else
+            exit_on_error("Unknown account: #{account}", 21) unless old_db_accounts[account]
+            puts "The account '#{account}' is not present in the configuration file, it will be deleted from the database"
+            exit unless ask_for_yes_no('Continue ?', auto_yes)
+
+            accounts_to_process = {}
+        end
+
+        db = old_db.clone
+        db_accounts = old_db_accounts.clone
+        db['accounts'] = db_accounts
+        if env && config[:all_accounts][account]
+            if db_accounts[account]
+                ## Deep copy through Marshal serialization/deserialization
+                db_accounts[account] = Marshal.load(Marshal.dump(old_db_accounts[account]))
+                db_accounts[account].each{ |region, env_list| env_list.delete(env) }
+            end
+        else
+            db_accounts.delete(account)
+        end
+    else
+        db = {'version' => DATABASE_VERSION, 'accounts' => {}}
+        db_accounts = db['accounts']
+
+        ## Only keep in the new db the accounts that are ignored, all the others will be refreshed
+        old_db_accounts.each do |acc_name, acc_data|
+            db_accounts[acc_name] = acc_data if config[:all_accounts][acc_name] && config[:all_accounts][acc_name]['ignore']
+        end
+
+        accounts_to_process = config[:all_accounts].reject{ |acc, prop| prop['ignore'] } # Don't process accounts marked as ignored
+    end
+    reg_to_refresh = accounts_to_process.map do |acc, prop|
+        (prop['regions'] || config[:default_regions]).map{ |reg| [acc, reg] }
+    end.flatten(1)
+    reg_num = reg_to_refresh.size
+    max_acc_col_size = 30
+    ## For account names longer than max_acc_col_size, we just give up on aligning them, they will look ugly :)
+    acc_col_size = reg_to_refresh.map{ |acc, reg| "#{acc}/#{reg}".size }.reject{ |prefix_size| prefix_size > max_acc_col_size }.max || 0
+
+    ## Fetch the instance names and process them
+    ## Threads are used to speed up the process through parallelism, an account/region pair being the unit of work
+    next_reg_index = 0
+    thread_list = []
+    mutex = Mutex.new
+    [MAX_THREAD_NUM, reg_num].min.times do
+        thread_list << Thread.new do
+            loop do
+                reg_index = nil
+                mutex.synchronize do
+                    reg_index = next_reg_index
+                    next_reg_index += 1
+                end
+                break if reg_index >= reg_num
+                (acc, reg) = reg_to_refresh[reg_index]
+
+                templates = (config[:all_accounts][acc]['templates'] || config[:default_templates]).map{ |tplt_id| config[:naming_templates][tplt_id] }.compact
+
+                instance_count = 0
+                restore_old_db = false
+                env_list = {}
+                acc_prefix = "#{acc}/#{reg}".ljust(acc_col_size) + ' '
+                begin
+                    fetch_ec2_instances(acc, reg, config).each do |i|
+                        name = i.tags.find{ |t| t.key == 'Name' }&.value
+                        az = i.placement.availability_zone
+                        (env_name, short_name) = extract_info_from_inst_name(config[:default_env], acc, reg, az, name || '', templates)
+                        next if env && env != env_name
+                        if env_name == '' || short_name == ''
+                            puts "#{acc_prefix}Instance skipped: #{name || '<unnamed>'} (#{i.instance_id}) -> #{i.state.name}" if $verbose
+                            next
+                        end
+                        instance_count += 1
+                        puts "#{acc_prefix}Instance found: #{env_name}/#{short_name} - #{name || '<unnamed>'} (#{i.instance_id}) -> #{i.state.name}" if $verbose
+                        env_list[env_name] ||= {}
+                        env_list[env_name][short_name] = (env_list[env_name][short_name] || []) | [name] # union
+                    end
+                rescue => error
+                    $stderr.puts "#{acc_prefix}ERROR: #{error}"
+
+                    ## Restore the old db
+                    env_list = (old_db_accounts[acc] && old_db_accounts[acc][reg]) ? old_db_accounts[acc][reg] : {}
+                    restore_old_db = true
+                end
+
+                ## Update the db with the found instances
+                mutex.synchronize do
+                    db_accounts[acc] ||= {}
+                    if env
+                        if env_list[env].nil? || env_list[env].empty?
+                            puts "#{acc_prefix}Env #{env} not found" unless restore_old_db
+                        else
+                            db_accounts[acc][reg] ||= {}
+                            db_accounts[acc][reg][env] = env_list[env]
+                            puts "#{acc_prefix}Env #{env} found (#{instance_count} instances)" unless restore_old_db
+                        end
+                    else
+                        if env_list.empty?
+                            puts "#{acc_prefix}No instances found" unless restore_old_db
+                        else
+                            db_accounts[acc][reg] = env_list
+                            puts "#{acc_prefix}Envs: #{env_list.keys.sort.join(', ')} (#{instance_count} instances)" unless restore_old_db
+                        end
+                    end
+                end
+            end
+        end
+    end
+    thread_list.each{ |t| t.join }; thread_list = []
+
+    ## Timestamp the database
+    db['latest_refresh'] = Time.now.strftime('%Y-%m-%d %H:%M:%S%z')
+
+    ## Atomically write the new db file
+    temp_db_filepath = "#{config[:db_filepath]}.#{Process.pid}.tmp" # Unique temp file name
+    begin
+        File.open(temp_db_filepath, 'w') do |f|
+            f.write(JSON.pretty_generate(db))
+        end
+
+        if File.exist?(config[:db_filepath])
+            backup_db_filepath = "#{config[:db_filepath]}.old"
+            File.rename(config[:db_filepath], backup_db_filepath)
+            puts "Backed up existing database to #{backup_db_filepath}" if $VERBOSE
+        end
+
+        File.rename(temp_db_filepath, config[:db_filepath])
+        puts "Database refreshed successfully: #{config[:db_filepath]}"
+    rescue => e
+        $stderr.puts "ERROR - Failed to write database file: #{e.message}"
+        begin
+            File.delete(temp_db_filepath) if File.exist?(temp_db_filepath)
+        rescue => cleanup_error
+            $stderr.puts "Warning - Could not clean up temporary file: #{cleanup_error.message}"
+        end
+        exit 22
+    end
+
+    exit 0
+end
+
+################### List the instances from the database
+if mode == :list
+    ## Load the database file
+    begin
+        db = load_database_file(config[:db_filepath], DATABASE_VERSION)
+    rescue => error
+        exit_on_error("Could not load database file: #{error}", 30)
+    end
+
+    ## Filter db content (keep only the relevant parts)
+    begin
+        db_accounts = filter_database(db['accounts'] || {}, config, account, env, instance)
+    rescue => error
+        exit_on_error(error.message, 31)
+    end
+
+    group_by_region = group_by_region_opt.nil? ? config[:group_by_region] : group_by_region_opt
+
+    ## Process each account
+    db_accounts.keys.sort.each do |acc|
+        acc_data = db_accounts[acc]
+        puts "\nACCOUNT: #{acc}"
+
+        ## Count unique environments
+        env_count = acc_data.values.flat_map(&:keys).uniq.size
+
+        ## Count unique [env, short_name] pairs
+        short_name_count = acc_data.flat_map{ |_region, reg_data|
+            reg_data.flat_map{ |env, env_data| env_data.keys.map{ |name| [env, name] } }
+        }.uniq.size
+
+        ## Count unique [region, instance_name] pairs
+        instance_name_count = acc_data.flat_map{ |region, reg_data|
+            reg_data.flat_map{ |_env, env_data|
+                env_data.flat_map{ |_short_name, inst_names|
+                    inst_names.map{ |inst_name| [region, inst_name] }
+                }
+            }
+        }.uniq.size
+
+        ## Table Columns
+        columns = group_by_region ? [['REGION', 20], ['ENV', 20]] : [['ENV', 20], ['REGION', 20]]
+        columns += $verbose ? [["SHORT NAME", 50], ["INSTANCE NAME", 150]] : [["SHORT NAME", 150]]
+
+        ## Swap the Region and Environment hierachy levels if required
+        acc_data = swap_region_env_levels(acc_data) unless group_by_region
+
+        ## Display the table
+        display_table(hash_to_table(acc_data, columns.size), columns) unless acc_data.empty?
+
+        ## Print account stats
+        puts "Total: #{env_count} environments, #{short_name_count} short names, #{instance_name_count} instance names"
+    end
+    puts
+end
+
+################### Display information about the instances by querying EC2
+if mode == :info
+    ## Load the database file
+    begin
+        db = load_database_file(config[:db_filepath], DATABASE_VERSION)
+    rescue => error
+        exit_on_error("Could not load database file: #{error}", 40)
+    end
+
+    ## Filter db content (keep only the relevant parts)
+    begin
+        db_accounts = filter_database(db['accounts'] || {}, config, account, env, instance)
+    rescue => error
+        exit_on_error(error.message, 41)
+    end
+
+    ## Fetch the instance info from EC2
+    instance_info = fetch_ec2_inst_from_db_accounts(db_accounts, config, MAX_THREAD_NUM)
+
+    ## Display the instance info
+    indent = 4
+    sep_width = 80
+    group_by_region = group_by_region_opt.nil? ? config[:group_by_region] : group_by_region_opt
+
+    ## lambda to display the region header, return true if an error is found
+    display_region_header = -> (acc, reg, lvln_ident) do
+        puts "\n#{' ' * lvln_ident}## REGION: #{reg}"
+
+        if instance_info[[acc, reg]].first == :error
+               puts "\n#{' ' * (lvln_ident + indent)}ERROR: #{instance_info[[acc, reg]].last}"
+               return true
+        end
+        return false
+    end
+
+    ## lambda to display the environment header with the instance count
+    display_env_header = -> (acc, env, env_data, lvln_ident) do
+        env_instance_count = env_data.keys.sum do |reg|
+            # Skip regions with errors
+            next 0 if instance_info[[acc, reg]].first == :error
+
+            instances_by_name = instance_info[[acc, reg]].last
+            inst_names = env_data[reg].values.flatten.compact.uniq
+            inst_names.flat_map{ |name| instances_by_name[name] || [] }.size
+        end
+
+        lvln_indent_str = ' ' * lvln_ident
+        puts "\n#{lvln_indent_str}ENVIRONMENT: #{env} (#{env_instance_count} instances found)"
+        puts "#{lvln_indent_str}#{'-' * (sep_width - lvln_ident)}"
+    end
+
+    ## Process each account
+    db_accounts.keys.sort.each do |acc|
+        acc_data = db_accounts[acc]
+
+        ## Count unique environments
+        env_count = acc_data.values.flat_map(&:keys).uniq.size
+        env_count_msg = env ? '' : " (#{env_count} environments)"
+
+        acc_sep = '=' * sep_width
+        puts
+        puts acc_sep
+        puts "ACCOUNT: #{acc}#{env_count_msg}"
+        puts acc_sep
+
+        ## Swap the Region and Environment hierachy levels if required
+        acc_data = swap_region_env_levels(acc_data) unless group_by_region
+
+        ## Process each region or environment
+        acc_data.sort.each do |lvl2, lvl2_data|
+            if group_by_region
+                region = lvl2
+                next if display_region_header.call(acc, region, indent)
+            else
+                env = lvl2
+                display_env_header.call(acc, env, lvl2_data, indent)
+            end
+
+            lvl2_data.sort.each do |lvl3, lvl3_data|
+                if group_by_region
+                    env = lvl3
+                    display_env_header.call(acc, env, {region => lvl3_data}, indent * 2)
+                else
+                    region = lvl3
+                    next if display_region_header.call(acc, region, indent * 2)
+                end
+                instances_by_name = instance_info[[acc, region]].last
+
+                ## Display the instances
+                lvl3_data.sort.each do |short_name, inst_names|
+                    puts "\n#{' ' * (indent * 3)}- SHORT NAME: #{short_name}"
+                    inst_names.sort.each do |inst_name|
+                        instances = instances_by_name[inst_name]
+                        unless (instances = instances_by_name[inst_name])&.any?
+                            puts "\n#{(' ' * (indent * 3))}  . Name: #{inst_name} not found"
+                            next
+                        end
+                        instance_count = instances.size
+                        instances.sort_by(&:instance_id).each_with_index do |inst, i|
+                            counter = instance_count > 1 ? " (#{i + 1}/#{instance_count})" : ''
+                            inst_indent_str = ' ' * (indent * 3 + 2)
+                            puts "\n#{inst_indent_str}. Name:  #{inst_name}#{counter}"
+                            puts "#{inst_indent_str}  Id:    #{inst.instance_id}"
+                            puts "#{inst_indent_str}  State: #{inst.state.name}"
+                            if $verbose
+                                puts "#{inst_indent_str}  Type:  #{inst.instance_type}"
+                                puts "#{inst_indent_str}  AZ:    #{inst.placement.availability_zone}"
+                                puts "#{inst_indent_str}  AMI:   #{inst.image_id}"
+                                puts "#{inst_indent_str}  Launch Time: #{inst.launch_time.strftime('%Y-%m-%d %H:%M:%S%z')}"
+                                puts "#{inst_indent_str}  Public DNS:  #{default(inst.public_dns_name, '<none>')}"
+                                puts "#{inst_indent_str}  Private DNS: #{default(inst.private_dns_name, '<none>')}"
+                                puts "#{inst_indent_str}  Public IP:   #{default(inst.public_ip_address, '<none>')}"
+                                puts "#{inst_indent_str}  Private IP:  #{default(inst.private_ip_address, '<none>')}"
+                                if instance
+                                    puts
+                                    puts "#{inst_indent_str}  Tags:#{' <none>' if inst.tags.empty?}"
+                                    inst.tags.sort_by(&:key).each do |tag|
+                                        puts "#{inst_indent_str}  . #{tag.key}: #{tag.value}"
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    puts
+end
+
+################### Open a SSM session to the instance
+if mode == :connect
+    ## Load the database file
+    begin
+        db = load_database_file(config[:db_filepath], DATABASE_VERSION)
+    rescue => error
+        exit_on_error("Could not load database file: #{error}", 50)
+    end
+
+    ## Filter db content (keep only the relevant parts)
+    begin
+        db_accounts = filter_database(db['accounts'] || {}, config, account, env, instance)
+    rescue => error
+        exit_on_error(error.message, 51)
+    end
+
+    ## Fetch the instance info from EC2
+    instance_info = fetch_ec2_inst_from_db_accounts(db_accounts, config, MAX_THREAD_NUM)
+
+    ## Process fetched instances
+    instance_table = []   ## columns: [number, intance_id, status, region, name]
+    eligible_instances = {}
+    eligible_instances_count = 0
+    rejected_instances_count = 0
+    instance_info.sort.each do |(_acc, region), (status, output)|
+        ## Instance names from database
+        instance_candidates = db_accounts[account][region][env][instance].sort
+
+        if status == :error
+            $stderr.puts "#{account}/#{region}: ERROR - Could not fetch instance info: #{output}"
+            instance_candidates.each do |inst_name|
+                instance_table << ['', '', 'ERROR', region, inst_name]
+            end
+            rejected_instances_count += instance_candidates.size
+            next
+        end
+
+        ## Instances fetched from EC2
+        instances_by_name = output
+        instance_candidates.each do |inst_name|
+            if instances_by_name[inst_name].nil?
+                rejected_instances_count += 1
+                instance_table << ['', '', 'NOT FOUND', region, inst_name]
+                next
+            end
+
+            instances_by_name[inst_name].sort_by(&:instance_id).each do |inst|
+                state = inst.state.name
+                if state == 'running'
+                    eligible_instances_count += 1
+                    eligible_instances[eligible_instances_count] = inst
+                    inst_num = eligible_instances_count.to_s
+                else
+                    rejected_instances_count += 1
+                    inst_num = ''
+                end
+                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst_name]
+            end
+        end
+    end
+
+    if $verbose || eligible_instances_count > 1 || rejected_instances_count > 0
+        ## Display the instance table
+        puts "Found #{eligible_instances_count} running instance(s):"
+        columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
+        display_table(instance_table, columns)
+    end
+
+    if eligible_instances_count == 0
+        $stderr.puts "\nERROR - No running instance found for '#{account} / #{env} / #{instance}'"
+        exit 52
+    end
+
+    if eligible_instances_count == 1
+        target_instance = eligible_instances[1]
+        if rejected_instances_count > 0
+            ## Only one running instance found, but some others were rejected
+            ## Ask the user if it's the instance he wants to connect to
+            puts "\nThere is only one running instance [#{target_instance.instance_id}] but some others were not available"
+            exit 53 unless ask_for_yes_no("Is it the one you want to connect to ?", auto_yes)
+        end
+    else
+        ## More than one running instance found, ask the user to select one
+        user_response = nil
+        loop do
+            puts "\nThere are #{eligible_instances_count} running instances"
+            puts "Please enter a number in the range [1-#{eligible_instances_count}] or press Ctrl-C to abort"
+            print "Your choice: "
+            user_response = read_user_input
+            puts
+            break if user_response =~ /^\d+$/ && user_response.to_i.between?(1, eligible_instances_count)
+            puts "Invalid choice: '#{user_response}', please try again"
+        end
+        target_instance = eligible_instances[user_response.to_i]
+    end
+    target_id = target_instance.instance_id
+    target_name = target_instance.tags.find{ |t| t.key == 'Name' }&.value || '<unnamed>'
+    target_az = target_instance.placement.availability_zone
+
+    ## Prepare the connection command
+    erb_vars = {
+        account:       account,
+        profile:       config[:all_accounts][account]['aws_profile'],
+        region:        target_az[0..-2],
+        az:            target_az,
+        env:           env,
+        short_name:    instance,
+        instance_id:   target_id,
+        instance_name: target_name,
+        ec2_instance:  target_instance,
+    }
+
+    ## Perform the ERB substitutions on the connect command
+    connect_command = config[:connect_command].map do |arg|
+        begin
+            erb_eval(arg, erb_vars)
+        rescue => error
+            $stderr.puts "ERROR - Failed to process argument '#{arg}' of the connect command: #{error}"
+            exit 54
+        end
+    end
+
+    ## Process the environment variables
+    connect_env_vars = config[:connect_env_vars].map do |var_name, var_value|
+        begin
+            var_value = erb_eval(var_value, erb_vars)
+        rescue => error
+            $stderr.puts "ERROR - Failed to process environment variable '#{var_name}': #{error}"
+            exit 55
+        end
+        [var_name, var_value]
+    end.to_h
+
+    ## Execute the connect command
+    puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S%z')} - Connecting to instance [#{target_id}] #{target_name} ..." if $verbose
+    puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S%z')} - Command: #{connect_command.join(' ')}" if $VERBOSE
+    exec(connect_env_vars, *connect_command)
+end
+
+################### Install bash completion script
+if mode == :install_completion
+
+    completed_cmd = std_script_name
+    current_script_name = ::File::basename($0)
+
+    if std_script_name != current_script_name
+        puts "It appears that the script has been renamed from '#{std_script_name}' to '#{current_script_name}'"
+        completed_cmd = current_script_name if ask_for_yes_no("Do you want the completion script to be installed for the new name '#{current_script_name}' ?", auto_yes)
+    end
+    complete_command_line = "complete -F _qss_completion #{completed_cmd}"
+
+    bash_completion_function = <<~'END_OF_COMPLETION_FUNCTION'
+_qss_completion() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    COMPREPLY=()
+
+    # Build cur_prefix, the part of $cur before the cursor
+    # It's the longest subchain being a $cur prefix and a $line_to_cursor suffix
+    local line_to_cursor="${COMP_LINE:0:$COMP_POINT}"
+    local line_len=${#line_to_cursor}
+    local cur_len=${#cur}
+    local max_prefix_size=$((cur_len < line_len ? cur_len : line_len))
+    local cur_prefix=''
+    local i
+    for(( i=max_prefix_size; i>=0; i-- )); do
+        local suffix="${line_to_cursor: -$i}"
+        local prefix="${cur:0:$i}"
+        if [[ "$suffix" == "$prefix" ]]; then
+            cur_prefix="$prefix"
+            break
+        fi
+    done
+
+    # Completion for --config value
+    if [[ "$prev" == "--config" || "$prev" =~ ^-[a-zA-Z]*c$ ]]; then
+        COMPREPLY=( $(compgen -f -- "$cur_prefix") ) # Suggest files
+        return 0
+    fi
+
+    # Build the list of arguments to pass to the ruby script
+    # We only pass the words up to the current word
+    # Words before the current word are expanded (e.g. quotes, variables, etc.)
+    local words_to_ruby=()
+    local processed_word
+    for (( i=0; i < COMP_CWORD; i++ )); do
+        eval "processed_word=${COMP_WORDS[i]}" 2>/dev/null
+        words_to_ruby+=("$processed_word")
+    done
+    words_to_ruby+=("$cur")
+
+    local completions=$(/usr/bin/env ruby - "${words_to_ruby[@]}"  <<'EOC'
+        begin
+            opt_mode_table = {
+                '--refresh'            => :refresh,
+                '-r'                   => :refresh,
+                '--list'               => :list,
+                '-l'                   => :list,
+                '--info'               => :info,
+                '-i'                   => :info,
+                '--install-completion' => :install_completion,
+            }
+
+            # For each mode: [<max number of positional args>, <list of mode specific options>]
+            mode_info_table = {
+                connect:            [3, opt_mode_table.keys],
+                refresh:            [2, []],
+                list:               [2, ['--group_by_region', '-R', '--group_by_env', '-E']],
+                info:               [3, ['--group_by_region', '-R', '--group_by_env', '-E']],
+                install_completion: [0, []],
+            }
+
+            # Analyze the command line arguments
+            processing_options = true
+            is_opt_value = nil
+            opt_values = {}
+            mode = :connect
+            positional_args=[]
+            ARGV[1..-2].each do |arg|
+                if processing_options
+                    if is_opt_value
+                        opt_values[is_opt_value] = arg
+                        is_opt_value = nil
+                        next
+                    end
+                    if arg.start_with?('-')
+                        if arg == '--'
+                            processing_options = false
+                            next
+                        end
+                        if arg == '--account' || arg =~ /^-[a-zA-Z]*a$/
+                            is_opt_value = :account
+                        elsif arg == '--config'  || arg =~ /^-[a-zA-Z]*c$/
+                            is_opt_value = :config
+                        end
+                        mode = opt_mode_table[arg] || arg[/^-([a-zA-Z]{2,})$/, 1]&.chars&.lazy&.map{ |c| opt_mode_table["-#{c}"] }&.find(&:itself) || mode
+                        next
+                    end
+                    processing_options = false
+                end
+                positional_args << arg
+            end
+
+            # Completion for options
+            if processing_options && is_opt_value.nil? && ARGV[-1].start_with?('-')
+                option_list = ['--verbose', '-v', '--help', '-h']
+                option_list += mode_info_table[mode][1]
+                option_list += ['--config', '-c'] unless opt_values[:config] || mode == :install_completion
+                option_list += ['--account', '-a'] unless opt_values[:account] || mode == :install_completion
+                print option_list.join("\n")
+                exit 0
+            end
+
+            # No completion if all positional args are present
+            # atm, we don't know if default_account is present in the config file so this test cannot handle all cases
+            exit 0 if is_opt_value.nil? && positional_args.size + (opt_values[:account].nil? || opt_values[:account].empty? ? 0 : 1) >= mode_info_table[mode][0]
+
+            def expand_env(str)
+                # This regex substitutes $VAR, ${VAR} and %VAR% (Windows-style)
+                str.gsub(/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/) { ENV[$1] }
+            end
+
+            default_config_file = '~/.qss.json'
+            default_db_file     = '~/.qss.db'
+
+            require 'json'
+            config_file = opt_values[:config].nil? || opt_values[:config].empty? ? default_config_file : opt_values[:config]
+            config = JSON.parse(File.read(File.expand_path(config_file)))
+            db_file = expand_env(config['db_filepath'] || default_db_file)
+            db = JSON.parse(File.read(File.expand_path(db_file)))
+            db_accounts = db['accounts'] || {}
+
+            account_name = opt_values[:account] || config['default_account'].to_s
+            account_name = nil if account_name.empty?
+
+            # No completion if all positional args are present (now we know if default_account is present in the config file)
+            exit 0 if account_name && is_opt_value.nil? && positional_args.size + 1 >= mode_info_table[mode][0]
+
+            account_name ||= positional_args.shift
+            account_name = account_name&.downcase
+            env_name = positional_args[0]&.downcase
+
+            if is_opt_value == :account || account_name.nil?
+                # Get the list of accounts
+                account_list = db_accounts.keys.dup
+                account_list |= config['accounts'].keys if mode == :refresh && config['accounts']
+                print account_list.uniq.join("\n")
+                exit 0
+            end
+
+            account = db_accounts[account_name] || {}
+
+            unless env_name
+                # Get the list of envs for the specified account
+                env_list = account.map{ |reg, reg_data| reg_data.keys }.flatten.uniq
+                print env_list.join("\n")
+                exit 0
+            end
+
+            # Get the list of instances for the specified account and env
+            instance_list = account.map{ |reg, reg_data| reg_data[env_name]&.keys }.compact.flatten.uniq
+            print instance_list.join("\n")
+    rescue => e
+        $stderr.puts "qss completion error: #{e.message}" if ENV['QSS_COMPLETION_DEBUG']
+    end
+EOC
+    )
+
+    if [[ -n "$completions" ]]; then
+        local IFS=$'\n'
+        local -a precompreply
+        precompreply=( $(compgen -W "${completions}" -- "$cur_prefix") )
+
+        if [[ ${cur::1} == "'" || ${cur::1} == '"' ]]; then
+            # The argument is already between quotes
+            COMPREPLY=("${precompreply[@]}")
+        else
+            # Quote special characters (eg spaces)
+            local comp
+            for comp in "${precompreply[@]}"; do
+                COMPREPLY+=("$(printf "%q" "$comp")")
+            done
+        fi
+    fi
+    return 0
+}
+END_OF_COMPLETION_FUNCTION
+
+    bash_completion_script = bash_completion_function + "\n" + complete_command_line
+
+    ## Try to find a directory candidate for the completion file
+    completion_dirs.unshift(ENV[completion_dir_var]) if ENV[completion_dir_var] && !ENV[completion_dir_var].empty?
+    completion_dir = completion_dirs.map{ |dir| File.expand_path(dir) }.find{ |dir| Dir.exist?(dir) }
+
+    target_file_path = nil
+    if completion_dir
+        target_file_path = File.join(completion_dir, completed_cmd)
+
+        puts "Found user bash completion directory: #{completion_dir}"
+        puts "I propose to install the bash completion script as '#{target_file_path}'"
+        puts "That file already exists, so it will be overwritten" if File.exist?(target_file_path)
+        target_file_path = nil unless ask_for_yes_no('Do you want to proceed with the installation in this location?', auto_yes)
+    end
+
+    if target_file_path.nil?
+        loop do
+            ## Prompt the user for the target file path
+            puts "Please specify the target file path for the bash completion script"
+            puts "This file will have to be sourced in your bash initialization file (e.g., ~/.bashrc)"
+            print "Enter a path: "
+            target_file_path_raw = read_user_input
+            puts
+            if target_file_path_raw.empty?
+                puts "Try again or press Ctrl-C to cancel"
+                puts
+                next
+            end
+
+            ## Complete the path if it is a directory
+            target_file_path = File.expand_path(target_file_path_raw)
+            target_file_path = File.join(target_file_path, completed_cmd) if target_file_path_raw.end_with?('/') || File.directory?(target_file_path)
+
+            if File.exist?(target_file_path)
+                puts "The file already exists, it will be overwritten"
+            else
+                puts "The target directory does not exist, it will be created" unless File.exist?(File.dirname(target_file_path))
+            end
+
+            break if ask_for_yes_no("Please confirm the creation of the file '#{target_file_path}'", auto_yes)
+            puts
+            puts "You can press Ctrl-C to abort the script execution, or enter a new target file path"
+            puts
+        end
+    end
+
+    ## Ensure the target directory exists
+    target_dir = File.dirname(target_file_path)
+    unless Dir.exist?(target_dir)
+        begin
+            require 'fileutils' # Required for FileUtils.mkdir_p
+            FileUtils.mkdir_p(target_dir)
+            puts "Created directory: #{target_dir}" if $VERBOSE
+        rescue SystemCallError => e
+            exit_on_error("Could not create directory #{target_dir}: #{e.message}", 60)
+        end
+    end
+
+    ## Write the completion script to the target file
+    begin
+        File.open(target_file_path, 'w') do |file|
+            file.write(bash_completion_script)
+        end
+        puts "Bash completion script successfully installed to: #{target_file_path}"
+        puts "Please source this file in your bash configuration (e.g., ~/.bashrc or ~/.bash_profile),"
+        puts "or ensure it's in a directory scanned by bash-completion, then restart your shell or run:"
+        puts "  source #{target_file_path}"
+    rescue SystemCallError => e
+        exit_on_error("Could not write to file #{target_file_path}: #{e.message}", 61)
+    end
+
+    exit 0
+end
