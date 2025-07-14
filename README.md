@@ -1,32 +1,32 @@
 # QSS - Quick SSM Session
 
-QSS (Quick SSM Session) is a command-line tool designed to streamline the process of connecting to EC2 instances using AWS Systems Manager (SSM) Session Manager. It acts as a user-friendly frontend to the AWS CLI, abstracting away much of the underlying complexity. If you find yourself frequently navigating multiple AWS accounts, regions, and environments, QSS can significantly simplify your workflow.
+QSS (Quick SSM Session) is a command-line tool that makes it easier to connect to EC2 instances via AWS Systems Manager (SSM) Session Manager. It's a user-friendly frontend to the AWS CLI, removing much of the inherent complexity from the process. If you're frequently switching between several AWS accounts, regions, and environments, QSS can significantly simplify your workflow.
 
-The core idea behind QSS is to let you connect to an instance using a memorable and logical hierarchy: an *account name*, an *environment name* (e.g., `staging`, `production`), and an *instance short name* (e.g., `app-server-01`). You no longer need to recall specific instance IDs, AWS regions, or profile names for each connection.
+The main idea of QSS is to let you connect to an instance through a memorable and sensible hierarchy: an *account name*, an *environment name* (e.g., `staging`, `production`), and an *instance short name* (e.g., `app-server-01`). You will not need to memorize instance IDs, regions, and profile names for each connection you establish.
 
-One of its standout features is its powerful **bash completion** support. This not only speeds up command entry for accounts, environments, and instance short names but also allows you to interactively explore your available infrastructure. As you type, the QSS completion suggests valid options, making it easy to discover and select the instance you need.
+One of its strongest features is its **bash completion** support. This not only speeds up command entry for accounts, environments, and instance short names but also allows you to interactively explore your available infrastructure. As you type, the QSS completion suggests valid options, making it easy to discover and select the instance you need.
 
-QSS achieves this by maintaining a local database of your EC2 instances. This database indexes instances by their account, environment, and short name. Environment and short names are dynamically extracted from your actual EC2 instance names (from the "Name" tag) using customizable regular expressions. This means consistent instance naming conventions are key to leveraging QSS effectively. The local database can be easily refreshed, either entirely or per account/environment, ensuring it stays up-to-date with your cloud resources.
+QSS does this by keeping a local database of your EC2 instances. This database indexes instances by their account, environment, and short name. Environment and short names are dynamically extracted from your actual EC2 instance names (from the "Name" tag) using customizable regular expressions. This means consistent instance naming conventions are key to leveraging QSS effectively. The local database can be easily refreshed, either entirely or per account/environment, ensuring it stays up-to-date with your cloud resources.
 
-A key design choice for robustness is that the local database primarily stores instance *names* rather than fixed instance IDs. The actual instance ID is resolved dynamically at connection time (or when requesting info). This approach gracefully handles scenarios where instances are re-created by Auto Scaling Groups, as their names often persist while their IDs change.
+One of QSS's design choices is that the local database primarily stores instance *names* rather than fixed instance IDs. The actual instance ID is resolved dynamically at connection time (or when requesting info). This approach handles scenarios where instances are re-created by Auto Scaling Groups, since their names often persist while their IDs change.
 
 Beyond just connecting, QSS allows you to:
 - List instances from its local database.
 - Display detailed information about indexed instances by querying EC2 in real-time (state, IDs, IPs, tags, and more).
 
-Highly customizable through a JSON configuration file (`~/.qss.json` by default), QSS lets you define your accounts, AWS profiles, regions, naming templates, and even the exact connection command. If you're looking for a way to make SSM sessions faster, more intuitive, and less error-prone across complex AWS setups, QSS might be the tool for you.
+Customizable through a JSON configuration file (`~/.qss.json` by default), QSS lets you define your accounts, AWS profiles, regions, naming templates, and even the command to connect. If you're looking for a way to make SSM sessions faster, more intuitive, and less error-prone on complex AWS setups, QSS could be the solution for you.
 
 ## Features
 
 -   **Quick Connections**: Easily connect to EC2 instances via AWS SSM Session Manager using `account/environment/short-name` identifiers.
--   **Powerful Bash Completion**: Interactive command-line completion for accounts, environments, and instance names.
+-   **Powerful Bash Completion**: Interactive command-line completion of accounts, environments, and instance names.
 -   **Local Instance Database**: Maintains a local, quickly refreshable JSON database of your instances, indexed for fast lookups.
 -   **Dynamic Name & Environment Parsing**: Automatically extracts environment and short names from EC2 instance `Name` tags using user-defined regex templates.
 -   **Robust Instance ID Handling**: Resolves instance IDs at connection time, making it resilient to instance re-creation by Auto Scaling Groups.
--   **Instance Listing**: List instances from the local database with flexible grouping by region or environment.
--   **Detailed Instance Information**: Display comprehensive, real-time EC2 instance details (state, IDs, IPs, tags, etc.) directly from AWS.
--   **Multi-Account & Multi-Region**: Designed from the ground up for users working across numerous AWS accounts and regions.
--   **Highly Customizable**: Extensive configuration options via a `~/.qss.json` file, including AWS profiles, regions, naming templates, and custom connection commands.
+-   **Instance Listing**: List instances from the local database grouped by region or environment, as desired.
+-   **Detailed Instance Information**: Displays rich, real-time EC2 instance details (state, IDs, IPs, tags, etc.) directly from AWS.
+-   **Multi-Account & Multi-Region**: Designed from the ground up for users working across multiple AWS accounts and regions.
+-   **Highly Customizable**: Many configuration options via a `~/.qss.json` file, including AWS profiles, regions, naming templates, and custom connection commands.
 -   **AWS CLI Frontend**: Acts as an intelligent and user-friendly layer on top of the AWS CLI for SSM session management.
 -   **Bash Completion Installation**: Includes a command to help install the bash completion script.
 
@@ -34,7 +34,7 @@ Highly customizable through a JSON configuration file (`~/.qss.json` by default)
 
 - Ruby 2.4 or higher
   _A Ruby version supporting recent releases of the `aws-sdk-ec2` gem is recommended for better compatibility and security._
-- Ruby gems:
+- Required Ruby gems:
   - `aws-sdk-ec2` (for EC2 instance interactions)
   - `json-schema` (for configuration validation)
 - AWS CLI installed and configured
@@ -55,7 +55,7 @@ Highly customizable through a JSON configuration file (`~/.qss.json` by default)
     chmod +x /path/to/your/qss
     ```
 
-3.  Install required gems:
+3.  Install the required gems:
     ```bash
     gem install aws-sdk-ec2 json-schema
     ```
@@ -64,7 +64,7 @@ Highly customizable through a JSON configuration file (`~/.qss.json` by default)
     ```bash
     /path/to/your/qss --install-completion
     ```
-    The script will guide you through the installation process. It will prompt for the installation destination and may suggest an existing bash completion directory if one is detected. If the completion script isn't installed in a directory automatically sourced by your shell, you'll need to add a line to source it in your bash initialization file (e.g., `~/.bashrc` or `~/.bash_profile`), for example:
+    This command will guide you through the installation process. It will prompt for the installation destination and may suggest an existing bash completion directory if one is detected. If the completion script isn't installed in a directory automatically sourced by your shell, you will need to add a line to source it in your bash initialization file (e.g., `~/.bashrc` or `~/.bash_profile`), for example:
     ```bash
     source /path/to/your/qss_completion_script
     ```
@@ -99,7 +99,7 @@ Create a configuration file at `~/.qss.json`. Here's an example:
 }
 ```
 
-This example configuration file demonstrates key features:
+This example configuration file demonstrates several features:
 
 -   `"default_env": "noenv"`: Specifies that if an instance name doesn't match any naming template or if a template doesn't explicitly define an environment, it will be assigned to the "noenv" environment.
 -   `"default_regions": ["eu-west-3"]`: Sets "eu-west-3" as the default AWS region to scan for instances if an account definition doesn't specify its own regions.
@@ -116,7 +116,7 @@ This example configuration file demonstrates key features:
 This configuration allows QSS to understand your AWS account structure, how to authenticate, which regions to target, and how to interpret your instance naming conventions to build its local database for quick connections.
 A comprehensive description of all configuration options is available below in the "Configuration Options" section.
 
-After creating or editing the configuration file, you'll typically want to refresh the QSS database by running the refresh command:
+Once you have created or modified the configuration file, you will usually want to refresh the QSS database by executing the refresh command:
 
 ```bash
 qss --refresh
