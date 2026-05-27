@@ -79,7 +79,7 @@ def usage(rc = 0)
 
     output.puts %Q{\
 .
-. QSS - Quick SSM Session v1.0.1
+. QSS - Quick SSM Session v1.0.2
 . Usage: #{me} [options] <account> <env name> <instance short name>
 .        #{me} --refresh [options] [<account> [<env name>]]
 .        #{me} --list    [options] [<account> [<env name>]]
@@ -716,8 +716,36 @@ end
 
 raise config_error if config_error
 
+##########################################################################
+
+class QSSApp
+
+def initialize(config:, account:, env:, instance:, auto_yes:, group_by_region_opt:,
+               std_script_name:, completion_dir_var:, completion_dirs:)
+    @config              = config
+    @account             = account
+    @env                 = env
+    @instance            = instance
+    @auto_yes            = auto_yes
+    @group_by_region_opt = group_by_region_opt
+    @std_script_name     = std_script_name
+    @completion_dir_var  = completion_dir_var
+    @completion_dirs     = completion_dirs
+end
+
+def run(mode)
+    send(mode)
+end
+
+private
+
 ################### Refresh the instance database
-if mode == :refresh
+def refresh
+    config   = @config
+    account  = @account
+    env      = @env
+    auto_yes = @auto_yes
+
     ## Check if the default account points to a valid account
     if default(config[:default_account]) && !config[:all_accounts][config[:default_account]]
         $stderr.puts "Warning - The configured default account points to an account '#{config[:default_account]}' that does not exist in the configuration file"
@@ -907,7 +935,13 @@ if mode == :refresh
 end
 
 ################### List the instances from the database
-if mode == :list
+def list
+    config              = @config
+    account             = @account
+    env                 = @env
+    instance            = @instance
+    group_by_region_opt = @group_by_region_opt
+
     ## Load the database file
     begin
         db = load_database_file(config[:db_filepath], DATABASE_VERSION)
@@ -963,7 +997,13 @@ if mode == :list
 end
 
 ################### Display information about the instances by querying EC2
-if mode == :info
+def info
+    config              = @config
+    account             = @account
+    env                 = @env
+    instance            = @instance
+    group_by_region_opt = @group_by_region_opt
+
     ## Load the database file
     begin
         db = load_database_file(config[:db_filepath], DATABASE_VERSION)
@@ -1093,7 +1133,13 @@ if mode == :info
 end
 
 ################### Open a SSM session to the instance
-if mode == :connect
+def connect
+    config   = @config
+    account  = @account
+    env      = @env
+    instance = @instance
+    auto_yes = @auto_yes
+
     ## Load the database file
     begin
         db = load_database_file(config[:db_filepath], DATABASE_VERSION)
@@ -1232,7 +1278,11 @@ if mode == :connect
 end
 
 ################### Install bash completion script
-if mode == :install_completion
+def install_completion
+    auto_yes           = @auto_yes
+    std_script_name    = @std_script_name
+    completion_dir_var = @completion_dir_var
+    completion_dirs    = @completion_dirs
 
     completed_cmd = std_script_name
     current_script_name = ::File::basename($0)
@@ -1493,3 +1543,19 @@ END_OF_COMPLETION_FUNCTION
 
     exit 0
 end
+
+end # class QSSApp
+
+##########################################################################
+
+QSSApp.new(
+    config:              config,
+    account:             account,
+    env:                 env,
+    instance:            instance,
+    auto_yes:            auto_yes,
+    group_by_region_opt: group_by_region_opt,
+    std_script_name:     std_script_name,
+    completion_dir_var:  completion_dir_var,
+    completion_dirs:     completion_dirs,
+).run(mode)
