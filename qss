@@ -79,14 +79,15 @@ def usage(rc = 0)
 
     output.puts %Q{\
 .
-. QSS - Quick SSM Session v1.0.2
+. QSS - Quick SSM Session v1.0.3
 . Usage: #{me} [options] <account> <env name> <instance short name>
 .        #{me} --refresh [options] [<account> [<env name>]]
 .        #{me} --list    [options] [<account> [<env name>]]
 .        #{me} --info    [options] [<account> [<env name> [<instance short name>]]]
+.        #{me} --get-id   [--all] [options] <account> <env name> <instance short name>
 .        #{me} --install-completion
 .
-. Options --refresh, --list, --info and --install-completion are actually
+. Options --refresh, --list, --info, --get-id and --install-completion are actually
 . commands in disguise, if none of them is specified, the script will try
 . to connect to the instance which is the main purpose of this script.
 .
@@ -98,6 +99,8 @@ def usage(rc = 0)
 .   -r, --refresh         Refresh the instance database
 .   -l, --list            List content of the instance database
 .   -i, --info            Display information about instances
+.   -g, --get-id          Retrieve the EC2 instance ID
+.   -A, --all             Return all matching IDs without prompting (use with --get-id)
 .   -R, --group_by_region Group instances by account/region/env (use with --list and --info)
 .   -E, --group_by_env    Group instances by account/env/region (use with --list and --info)
 .   --install-completion  Install bash completion script
@@ -378,20 +381,20 @@ end
 
 ##########################################################################
 
-def ask_for_yes_no(msg, auto_yes = false, default = true)
+def ask_for_yes_no(msg, auto_yes = false, default = true, output: $stdout)
     full_msg = "#{msg} #{default ? '[Y/n]' : '[y/N]'} "
     user_response = nil
     loop do
-        print full_msg
+        output.print full_msg
         if auto_yes
-            puts "(auto-yes)"
+            output.puts "(auto-yes)"
             return true
         end
         user_response = read_user_input.downcase
-        puts
+        output.puts
         return default if user_response.empty? && !default.nil?
         break if user_response =~ /^(y(es)?|n(o)?)$/i
-        puts "You answered '#{user_response}' and it is not clear if that was supposed to be a yes or a no, let's try again."
+        output.puts "You answered '#{user_response}' and it is not clear if that was supposed to be a yes or a no, let's try again."
     end
     return !(user_response =~ /^n/i)
 end
@@ -502,7 +505,7 @@ end
 ## has to be bigger or equal to the number of columns
 ## For the last column, arrays are accepted instead of hashes
 ## columns format: [[<column name>, <column max width>], ...]
-def display_table(table, columns, col_separator = ' | ')
+def display_table(table, columns, col_separator = ' | ', output: $stdout)
     ## Extract column names and widths
     col_number = columns.size
     col_names = columns.map{ |c| c[0] }
@@ -517,11 +520,11 @@ def display_table(table, columns, col_separator = ' | ')
     horiz_separator = '-' * table_width
 
     ## Print the table
-    puts horiz_separator
-    puts build_table_row_str(col_names, col_widths, col_separator)
-    puts horiz_separator
-    table.each{ |row| puts build_table_row_str(row, col_widths, col_separator) }
-    puts horiz_separator
+    output.puts horiz_separator
+    output.puts build_table_row_str(col_names, col_widths, col_separator)
+    output.puts horiz_separator
+    table.each{ |row| output.puts build_table_row_str(row, col_widths, col_separator) }
+    output.puts horiz_separator
 end
 
 ##########################################################################
@@ -626,6 +629,7 @@ mode_counter        = 0
 group_by_region_opt = nil
 account_opt         = nil
 auto_yes            = false
+get_id_all          = false
 config_filepath     = '~/.qss.json'
 std_script_name     = 'qss'
 
@@ -652,6 +656,8 @@ begin
         [ '--list',            '-l', ::GetoptLong::NO_ARGUMENT ],
         [ '--info',            '-i', ::GetoptLong::NO_ARGUMENT ],
         [ '--install-completion',    ::GetoptLong::NO_ARGUMENT ],
+        [ '--get-id',          '-g', ::GetoptLong::NO_ARGUMENT ],
+        [ '--all',             '-A', ::GetoptLong::NO_ARGUMENT ],
         [ '--group_by_region', '-R', ::GetoptLong::NO_ARGUMENT ],
         [ '--group_by_env',    '-E', ::GetoptLong::NO_ARGUMENT ],
         [ '--verbose',         '-v', ::GetoptLong::NO_ARGUMENT ],
@@ -676,6 +682,10 @@ begin
         when '--install-completion' then mode = :install_completion
                                          valid_argc = [0]
                                          mode_counter += 1
+        when '--get-id'             then mode = :get_id
+                                         valid_argc = [3]
+                                         mode_counter += 1
+        when '--all'                then get_id_all = true
         when '--group_by_region'    then group_by_region_opt = true
         when '--group_by_env'       then group_by_region_opt = false
         ## Repeat the --verbose option twice to enable debug-level verbosity
@@ -688,7 +698,7 @@ begin
         end
     end
 
-    raise "Options --refresh, --list, --info and --install-completion are mutually exclusive" if mode_counter > 1
+    raise "Options --refresh, --list, --info, --get-id and --install-completion are mutually exclusive" if mode_counter > 1
 
     ## We have to read the config file before checking the number of arguments as the
     ## presence of a default account can change the expected number of arguments
@@ -720,13 +730,14 @@ raise config_error if config_error
 
 class QSSApp
 
-def initialize(config:, account:, env:, instance:, auto_yes:, group_by_region_opt:,
+def initialize(config:, account:, env:, instance:, auto_yes:, get_id_all:, group_by_region_opt:,
                std_script_name:, completion_dir_var:, completion_dirs:)
     @config              = config
     @account             = account
     @env                 = env
     @instance            = instance
     @auto_yes            = auto_yes
+    @get_id_all          = get_id_all
     @group_by_region_opt = group_by_region_opt
     @std_script_name     = std_script_name
     @completion_dir_var  = completion_dir_var
@@ -1277,6 +1288,117 @@ def connect
     exec(connect_env_vars, *connect_command)
 end
 
+################### Retrieve the EC2 instance ID
+def get_id
+    config     = @config
+    account    = @account
+    env        = @env
+    instance   = @instance
+    auto_yes   = @auto_yes
+    get_id_all = @get_id_all
+
+    ## Load the database file
+    begin
+        db = load_database_file(config[:db_filepath], DATABASE_VERSION)
+    rescue => error
+        exit_on_error("Could not load database file: #{error}", 70)
+    end
+
+    ## Filter db content (keep only the relevant parts)
+    begin
+        db_accounts = filter_database(db['accounts'] || {}, config, account, env, instance)
+    rescue => error
+        exit_on_error(error.message, 71)
+    end
+
+    ## Fetch the instance info from EC2
+    instance_info = fetch_ec2_inst_from_db_accounts(db_accounts, config, MAX_THREAD_NUM)
+
+    ## Process fetched instances
+    instance_table = []   ## columns: [number, instance_id, status, region/az, name]
+    eligible_instances = {}
+    eligible_instances_count = 0
+    rejected_instances_count = 0
+    instance_info.sort.each do |(_acc, region), (status, output)|
+        instance_candidates = db_accounts[account][region][env][instance].sort
+
+        if status == :error
+            $stderr.puts "#{account}/#{region}: ERROR - Could not fetch instance info: #{output}"
+            instance_candidates.each do |inst_name|
+                instance_table << ['', '', 'ERROR', region, inst_name]
+            end
+            rejected_instances_count += instance_candidates.size
+            next
+        end
+
+        instances_by_name = output
+        instance_candidates.each do |inst_name|
+            if instances_by_name[inst_name].nil?
+                rejected_instances_count += 1
+                instance_table << ['', '', 'NOT FOUND', region, inst_name]
+                next
+            end
+
+            instances_by_name[inst_name].sort_by(&:instance_id).each do |inst|
+                state = inst.state.name
+                if state == 'running'
+                    eligible_instances_count += 1
+                    eligible_instances[eligible_instances_count] = inst
+                    inst_num = eligible_instances_count.to_s
+                else
+                    rejected_instances_count += 1
+                    inst_num = ''
+                end
+                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst_name]
+            end
+        end
+    end
+
+    if eligible_instances_count == 0
+        $stderr.puts "\nERROR - No running instance found for '#{account} / #{env} / #{instance}'"
+        exit 72
+    end
+
+    columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
+
+    if get_id_all
+        ## Non-interactive mode: print all running instance IDs, one per line on stdout
+        if $verbose || rejected_instances_count > 0
+            $stderr.puts "Found #{eligible_instances_count} running instance(s):"
+            display_table(instance_table, columns, output: $stderr)
+        end
+        eligible_instances.each_value { |inst| puts inst.instance_id }
+    else
+        ## Interactive mode: user selects one instance if several candidates
+        if $verbose || eligible_instances_count > 1 || rejected_instances_count > 0
+            $stderr.puts "Found #{eligible_instances_count} running instance(s):"
+            display_table(instance_table, columns, output: $stderr)
+        end
+
+        if eligible_instances_count == 1
+            target_instance = eligible_instances[1]
+            if rejected_instances_count > 0
+                $stderr.puts "\nThere is only one running instance [#{target_instance.instance_id}] but some others were not available"
+                exit 73 unless ask_for_yes_no("Is it the one whose ID you want to retrieve ?", auto_yes, output: $stderr)
+            end
+        else
+            ## More than one running instance found, ask the user to select one
+            user_response = nil
+            loop do
+                $stderr.puts "\nThere are #{eligible_instances_count} running instances"
+                $stderr.puts "Please enter a number in the range [1-#{eligible_instances_count}] or press Ctrl-C to abort"
+                $stderr.print "Your choice: "
+                user_response = read_user_input
+                $stderr.puts
+                break if user_response =~ /^\d+$/ && user_response.to_i.between?(1, eligible_instances_count)
+                $stderr.puts "Invalid choice: '#{user_response}', please try again"
+            end
+            target_instance = eligible_instances[user_response.to_i]
+        end
+        puts target_instance.instance_id
+    end
+end
+
 ################### Install bash completion script
 def install_completion
     auto_yes           = @auto_yes
@@ -1342,6 +1464,8 @@ _qss_completion() {
                 '-l'                   => :list,
                 '--info'               => :info,
                 '-i'                   => :info,
+                '--get-id'             => :get_id,
+                '-g'                   => :get_id,
                 '--install-completion' => :install_completion,
             }
 
@@ -1351,6 +1475,7 @@ _qss_completion() {
                 refresh:            [2, []],
                 list:               [2, ['--group_by_region', '-R', '--group_by_env', '-E']],
                 info:               [3, ['--group_by_region', '-R', '--group_by_env', '-E']],
+                get_id:             [3, ['--all', '-A']],
                 install_completion: [0, []],
             }
 
@@ -1554,6 +1679,7 @@ QSSApp.new(
     env:                 env,
     instance:            instance,
     auto_yes:            auto_yes,
+    get_id_all:          get_id_all,
     group_by_region_opt: group_by_region_opt,
     std_script_name:     std_script_name,
     completion_dir_var:  completion_dir_var,
