@@ -1,5 +1,19 @@
 # QSS - Quick SSM Session
 
+## tl;dr
+
+Without qss:
+```bash
+aws --profile dev-profile --region eu-west-3 ssm start-session --target i-0a1b2c3d4e5f67890
+```
+
+With qss:
+```bash
+qss dev staging app-server
+```
+
+---
+
 QSS (Quick SSM Session) is a command-line tool that makes it easier to connect to EC2 instances via AWS Systems Manager (SSM) Session Manager. It's a user-friendly frontend to the AWS CLI, removing much of the inherent complexity from the process. If you're frequently switching between several AWS accounts, regions, and environments, QSS can significantly simplify your workflow.
 
 The main idea of QSS is to let you connect to an instance through a memorable and sensible hierarchy: an *account name*, an *environment name* (e.g., `staging`, `production`), and an *instance short name* (e.g., `app-server-01`). You will not need to memorize instance IDs, regions, and profile names for each connection you establish.
@@ -11,6 +25,9 @@ QSS does this by keeping a local database of your EC2 instances. This database i
 One of QSS's design choices is that the local database primarily stores instance *names* rather than fixed instance IDs. The actual instance ID is resolved dynamically at connection time (or when requesting info). This approach handles scenarios where instances are re-created by Auto Scaling Groups, since their names often persist while their IDs change.
 
 Beyond just connecting, QSS allows you to:
+- Open **port-forwarding tunnels** to instances or remote hosts reachable through them.
+- **Execute commands** on instances interactively.
+- **Retrieve EC2 instance IDs** programmatically, useful for scripting.
 - List instances from its local database.
 - Display detailed information about indexed instances by querying EC2 in real-time (state, IDs, IPs, tags, and more).
 
@@ -19,6 +36,9 @@ Customizable through a JSON configuration file (`~/.qss.json` by default), QSS l
 ## Features
 
 -   **Quick Connections**: Easily connect to EC2 instances via AWS SSM Session Manager using `account/environment/short-name` identifiers.
+-   **Port-Forwarding Tunnels**: Open SSM port-forwarding tunnels to the instance itself or to remote hosts reachable through it (`--tunnel` / `-L`).
+-   **Interactive Command Execution**: Run a command on an instance interactively through SSM, similar to `ssh host <command>` (`--exec` / `-e`).
+-   **Instance ID Retrieval**: Retrieve the EC2 instance ID programmatically, with interactive or batch modes (`--get-id` / `-g`).
 -   **Powerful Bash Completion**: Interactive command-line completion of accounts, environments, and instance names.
 -   **Local Instance Database**: Maintains a local, quickly refreshable JSON database of your instances, indexed for fast lookups.
 -   **Dynamic Name & Environment Parsing**: Automatically extracts environment and short names from EC2 instance `Name` tags using user-defined regex templates.
@@ -166,8 +186,8 @@ All configuration options are defined within the `~/.qss.json` file.
 -   **`connect_command`**
     -   Type: `array` of `string`
     -   Default: `["aws", "--profile", "<%= profile %>", "--region", "<%= region %>", "ssm", "start-session", "--target", "<%= instance_id %>"]`
-    -   Description: An array of strings representing the command and its arguments used to establish the connection to the target instance. Each string in the array is treated as an ERB (Embedded Ruby) template.
-        The following variables are available for use within these ERB templates:
+    -   Description: An array of strings representing the command and its arguments used to establish a standard interactive session with the target instance. Each string in the array is treated as an ERB (Embedded Ruby) template.
+        The following variables are available for use within these ERB templates (the same set applies to `tunnel_command`, `exec_command`, and `connect_env_vars`):
         -   `account`: The QSS account name (e.g., `dev`).
         -   `profile`: The AWS CLI profile name configured for the account.
         -   `region`: The AWS region of the instance (e.g., `eu-west-3`).
@@ -177,11 +197,23 @@ All configuration options are defined within the `~/.qss.json` file.
         -   `instance_id`: The EC2 instance ID (e.g., `i-0123456789abcdef0`).
         -   `instance_name`: The value of the EC2 instance's "Name" tag.
         -   `ec2_instance`: The complete `Aws::EC2::Instance` object for the target instance, as returned by the AWS SDK for Ruby. This provides access to all instance attributes like IP addresses, VPC ID, security groups, tags, etc. (e.g., `<%= ec2_instance.public_ip_address %>`, `<%= ec2_instance.tags.find { |t| t.key == 'Owner' }&.value %>`). Refer to the _AWS SDK for Ruby V3 documentation for `Aws::EC2::Instance`_ for a full list of available attributes and methods.
+        -   `tunnel_spec`, `tunnel_local_port`, `tunnel_remote_host`, `tunnel_remote_port`, `tunnel_document`, `tunnel_parameters`: Available in all templates but set to `nil` when not in tunnel mode. Primarily used in `tunnel_command`.
+        -   `exec_cmd`: The command string passed via `--exec`. Available in all templates but `nil` when not in exec mode. Primarily used in `exec_command`.
+
+-   **`tunnel_command`**
+    -   Type: `array` of `string`
+    -   Default: `["aws", "--profile", "<%= profile %>", "--region", "<%= region %>", "ssm", "start-session", "--target", "<%= instance_id %>", "--document-name", "<%= tunnel_document %>", "--parameters", "<%= tunnel_parameters %>"]`
+    -   Description: The command template used when `--tunnel` / `-L` is specified. Same ERB variables as `connect_command`, with the tunnel-specific variables (`tunnel_document`, `tunnel_parameters`, `tunnel_local_port`, `tunnel_remote_host`, `tunnel_remote_port`, `tunnel_spec`) already populated. The default template covers both direct port-forwarding and remote-host forwarding automatically.
+
+-   **`exec_command`**
+    -   Type: `array` of `string`
+    -   Default: `["aws", "--profile", "<%= profile %>", "--region", "<%= region %>", "ssm", "start-session", "--target", "<%= instance_id %>", "--document-name", "AWS-StartInteractiveCommand", "--parameters", "command=[\"<%= exec_cmd %>\"]"]`
+    -   Description: The command template used when `--exec` / `-e` is specified. Same ERB variables as `connect_command`, plus `exec_cmd` which holds the command string to execute on the instance.
 
 -   **`connect_env_vars`**
     -   Type: `object` (string keys, string values)
     -   Default: `{}` (empty object)
-    -   Description: An object where keys are environment variable names and values are their corresponding string values. These environment variables will be set in the environment before executing the `connect_command`. The values are also ERB templates, with the same set of variables available as for `connect_command`.
+    -   Description: An object where keys are environment variable names and values are their corresponding string values. These environment variables will be set in the environment before executing any of `connect_command`, `tunnel_command`, or `exec_command`. The values are also ERB templates, with the full set of variables available (including tunnel and exec variables).
 
 -   **`accounts`**
     -   Type: `object`
@@ -216,7 +248,61 @@ Connect to an EC2 instance via SSM Session Manager. QSS will resolve the instanc
 # Connect to instance 'app-server' in environment 'staging' of account 'dev'
 qss dev staging app-server
 ```
-If multiple running instances match the provided criteria (e.g., if several instances have the same `Name` tag , or if a short name maps to multiple full instance names), QSS will list the available running instances and prompt you to select which one you want to connect to. If only one running instance is found but other non-running (e.g., stopped) instances also matched, QSS will inform you and ask for confirmation before connecting.
+If multiple running instances match the provided criteria (e.g., if several instances have the same `Name` tag, or if a short name maps to multiple full instance names), QSS will list the available running instances and prompt you to select which one you want to connect to. If only one running instance is found but other non-running (e.g., stopped) instances also matched, QSS will inform you and ask for confirmation before connecting.
+
+### Open a Port-Forwarding Tunnel
+
+Open an SSM port-forwarding tunnel using the `--tunnel` / `-L` option. Unlike a standard session, this does not open a shell — it keeps the tunnel open until you press Ctrl-C.
+
+```bash
+# Forward local port 5432 to port 5432 on the instance itself
+qss --tunnel 5432:5432 dev staging db-server
+
+# Forward local port 5432 to an RDS instance reachable through the EC2 instance
+qss --tunnel 5432:my-rds.internal.example.com:5432 dev staging app-server
+
+# Short form
+qss -L 8080:8080 dev staging app-server
+```
+
+The tunnel command template can be customized via `tunnel_command` in `~/.qss.json`.
+
+### Execute a Command on an Instance
+
+Run a command interactively on an instance using `--exec` / `-e`. The I/O streams in real-time with a TTY, similar to `ssh host <command>`.
+
+```bash
+# Check the status of the nginx service
+qss --exec "systemctl status nginx" dev staging web-server
+
+# Tail the application logs
+qss -e "tail -f /var/log/myapp/app.log" dev staging app-server
+```
+
+The command template can be customized via `exec_command` in `~/.qss.json`.
+
+### Retrieve an Instance ID
+
+Get the EC2 instance ID for a given instance using `--get-id` / `-g`.
+
+```bash
+# Interactive mode: prompts if multiple candidates, prints ID to stdout
+qss --get-id dev staging app-server
+
+# Non-interactive / batch mode: prints all matching running IDs, one per line
+qss --get-id --all dev staging app-server
+
+# JSON output (interactive): {"instance_id":"i-0abc...","profile":"dev-profile","region":"eu-west-3"}
+qss --get-id --json dev staging app-server
+
+# JSON output + all: array of all instances (any state) with status
+qss --get-id --all --json dev staging app-server
+# → [{"instance_id":"i-0abc...","profile":"dev-profile","region":"eu-west-3","status":"running"}, ...]
+
+# Useful in scripts:
+INSTANCE_ID=$(qss -g dev staging app-server)
+INSTANCE_JSON=$(qss -g -j dev staging app-server)
+```
 
 ### Refresh the Instance Database
 
@@ -312,6 +398,37 @@ This section details all available command-line options for `qss`.
     -   Displays detailed information about instances by querying AWS EC2 in real-time.
     -   Can be filtered by account, environment, and/or instance short name.
     -   Use with `--verbose` for extended details (instance type, AMI, IPs, tags, etc.).
+
+-   **`-g, --get-id`** `<account> <env name> <instance short name>`
+    -   Retrieves the EC2 instance ID for the specified instance.
+    -   In interactive mode (default), prompts the user to select an instance if multiple running candidates are found. Prints the selected ID to stdout.
+    -   Use with `--all` to print all matching running instance IDs without prompting (one per line on stdout). All other output goes to stderr, making this suitable for scripting.
+    -   Use with `--json` to output a JSON object instead of a plain ID (see below).
+
+-   **`-A, --all`**
+    -   Used with `--get-id`: returns all matching running instance IDs without prompting, one per line on stdout.
+    -   Combined with `--json`: returns **all** instances regardless of state (running, stopped, terminated…) as a JSON array.
+
+-   **`-j, --json`**
+    -   Used with `--get-id`: outputs result as JSON instead of a plain instance ID.
+    -   Without `--all` (interactive): outputs a single JSON object `{"instance_id", "profile", "region"}`.
+    -   With `--all`: outputs a JSON array of all instances (any state), each object containing `{"instance_id", "profile", "region", "status"}`. All other output (messages, progress) goes to stderr.
+
+-   **`-L, --tunnel <spec>`**
+    -   Opens an SSM port-forwarding tunnel to or through the target instance.
+    -   Cannot be combined with `--exec`.
+    -   The tunnel spec format is:
+        -   `local_port:remote_port` — forwards `local_port` on your machine to `remote_port` on the instance itself.
+        -   `local_port:remote_host:remote_port` — forwards `local_port` on your machine to `remote_host:remote_port` through the instance (the instance acts as a jump host).
+    -   Example: `qss --tunnel 5432:my-rds.internal:5432 dev staging app-server`
+    -   The command template used is `tunnel_command` (configurable in `~/.qss.json`).
+
+-   **`-e, --exec <command>`**
+    -   Executes a command on the target instance interactively via SSM (uses `AWS-StartInteractiveCommand`).
+    -   Similar to `ssh host <command>`: streams I/O in real-time with a TTY.
+    -   Cannot be combined with `--tunnel`.
+    -   Example: `qss --exec "journalctl -u nginx -f" dev staging app-server`
+    -   The command template used is `exec_command` (configurable in `~/.qss.json`).
 
 -   **`--install-completion`**
     -   Installs the bash completion script for `qss`.

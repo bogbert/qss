@@ -79,12 +79,12 @@ def usage(rc = 0)
 
     output.puts %Q{\
 .
-. QSS - Quick SSM Session v1.0.3
+. QSS - Quick SSM Session v1.1.0
 . Usage: #{me} [options] <account> <env name> <instance short name>
 .        #{me} --refresh [options] [<account> [<env name>]]
 .        #{me} --list    [options] [<account> [<env name>]]
 .        #{me} --info    [options] [<account> [<env name> [<instance short name>]]]
-.        #{me} --get-id   [--all] [options] <account> <env name> <instance short name>
+.        #{me} --get-id  [options] <account> <env name> <instance short name>
 .        #{me} --install-completion
 .
 . Options --refresh, --list, --info, --get-id and --install-completion are actually
@@ -101,6 +101,9 @@ def usage(rc = 0)
 .   -i, --info            Display information about instances
 .   -g, --get-id          Retrieve the EC2 instance ID
 .   -A, --all             Return all matching IDs without prompting (use with --get-id)
+.   -j, --json            Output result as JSON: {instance_id, profile, region} (or array with status when combined with --all)
+.   -L, --tunnel          Open a port-forwarding tunnel (format: local_port:remote_port or local_port:remote_host:remote_port)
+.   -e, --exec            Execute a command on the instance interactively (cannot be combined with --tunnel)
 .   -R, --group_by_region Group instances by account/region/env (use with --list and --info)
 .   -E, --group_by_env    Group instances by account/env/region (use with --list and --info)
 .   --install-completion  Install bash completion script
@@ -187,6 +190,25 @@ def validate_config(config)
             ## The following variables are available in the templates:
             ## account, profile, region, az, env, short_name, instance_id, instance_name, ec2_instance
             "connect_command" => {
+                "type" => "array",
+                "minItems" => 1,
+                "items" => {
+                    "type" => "string"
+                }
+            },
+            ## The command to use to open a port-forwarding tunnel (-L option)
+            ## Same ERB variables as connect_command, plus: tunnel_spec, tunnel_document, tunnel_parameters,
+            ## tunnel_local_port, tunnel_remote_host, tunnel_remote_port
+            "tunnel_command" => {
+                "type" => "array",
+                "minItems" => 1,
+                "items" => {
+                    "type" => "string"
+                }
+            },
+            ## The command to use to execute a command on the instance interactively (-e option)
+            ## Same ERB variables as connect_command, plus: exec_cmd
+            "exec_command" => {
                 "type" => "array",
                 "minItems" => 1,
                 "items" => {
@@ -282,6 +304,8 @@ def read_config_file(config_filepath, defaults)
         all_accounts:       config['accounts'] || {},
         naming_templates:   config['naming_templates'] || {},
         connect_command:    config['connect_command'] || defaults[:connect_command],
+        tunnel_command:     config['tunnel_command']  || defaults[:tunnel_command],
+        exec_command:       config['exec_command']    || defaults[:exec_command],
         connect_env_vars:   config['connect_env_vars'] || defaults[:connect_env_vars],
     }
 
@@ -423,13 +447,24 @@ end
 ##########################################################################
 
 def get_binding_from_hash(h)
-    OpenStruct.new(h).instance_eval{ binding }
+    os = OpenStruct.new(h.reject { |_, v| v.is_a?(Proc) || v.is_a?(Method) })
+    h.each { |key, val| os.define_singleton_method(key, &val) if val.is_a?(Proc) || val.is_a?(Method) }
+    os.instance_eval { binding }
 end
 
 ##########################################################################
 
 def erb_eval(template, variables = {})
-  ERB.new(template, trim_mode: '-').result(get_binding_from_hash(variables))
+  b = get_binding_from_hash(variables)
+  ## For templates that are purely a single expression (<%= expr %>),
+  ## return the raw Ruby value so that Array results can be flat-mapped
+  ## into connect_command without going through Array#to_s.
+  if (m = template.match(/\A\s*<%=\s*(.*?)\s*-?%>\s*\z/m))
+    result = b.eval(m[1])
+    return result if result.is_a?(Array)
+    return result.nil? ? '' : result.to_s
+  end
+  ERB.new(template, trim_mode: '-').result(b)
 rescue SyntaxError => e
   raise "Invalid ERB template: #{e.message}"
 rescue => e
@@ -528,8 +563,6 @@ def display_table(table, columns, col_separator = ' | ', output: $stdout)
 end
 
 ##########################################################################
-
-## Search for EC2 instances in a specific account and region
 ## It is possible to search for a list of instance names
 ## Terminated instances are not included in the search
 def fetch_ec2_instances(account_name, region, config, instance_names = nil, batch_size = 500)
@@ -630,6 +663,9 @@ group_by_region_opt = nil
 account_opt         = nil
 auto_yes            = false
 get_id_all          = false
+get_id_json         = false
+tunnel_spec         = nil
+exec_cmd            = nil
 config_filepath     = '~/.qss.json'
 std_script_name     = 'qss'
 
@@ -647,6 +683,8 @@ config_defaults = {
     group_by_region:  false,
     db_filepath:      '~/.qss.db',
     connect_command:  ['aws', '--profile', '<%= profile %>', '--region', '<%= region %>', 'ssm', 'start-session', '--target', '<%= instance_id %>'],
+    tunnel_command:   ['aws', '--profile', '<%= profile %>', '--region', '<%= region %>', 'ssm', 'start-session', '--target', '<%= instance_id %>', '--document-name', '<%= tunnel_document %>', '--parameters', '<%= tunnel_parameters %>'],
+    exec_command:     ['aws', '--profile', '<%= profile %>', '--region', '<%= region %>', 'ssm', 'start-session', '--target', '<%= instance_id %>', '--document-name', 'AWS-StartInteractiveCommand', '--parameters', 'command=["<%= exec_cmd %>"]'],
     connect_env_vars: {}
 }
 
@@ -658,6 +696,9 @@ begin
         [ '--install-completion',    ::GetoptLong::NO_ARGUMENT ],
         [ '--get-id',          '-g', ::GetoptLong::NO_ARGUMENT ],
         [ '--all',             '-A', ::GetoptLong::NO_ARGUMENT ],
+        [ '--json',            '-j', ::GetoptLong::NO_ARGUMENT ],
+        [ '--tunnel',          '-L', ::GetoptLong::REQUIRED_ARGUMENT ],
+        [ '--exec',            '-e', ::GetoptLong::REQUIRED_ARGUMENT ],
         [ '--group_by_region', '-R', ::GetoptLong::NO_ARGUMENT ],
         [ '--group_by_env',    '-E', ::GetoptLong::NO_ARGUMENT ],
         [ '--verbose',         '-v', ::GetoptLong::NO_ARGUMENT ],
@@ -686,6 +727,9 @@ begin
                                          valid_argc = [3]
                                          mode_counter += 1
         when '--all'                then get_id_all = true
+        when '--json'               then get_id_json = true
+        when '--tunnel'             then tunnel_spec = arg
+        when '--exec'               then exec_cmd    = arg
         when '--group_by_region'    then group_by_region_opt = true
         when '--group_by_env'       then group_by_region_opt = false
         ## Repeat the --verbose option twice to enable debug-level verbosity
@@ -699,6 +743,7 @@ begin
     end
 
     raise "Options --refresh, --list, --info, --get-id and --install-completion are mutually exclusive" if mode_counter > 1
+    raise "Options --tunnel and --exec cannot be combined" if tunnel_spec && exec_cmd
 
     ## We have to read the config file before checking the number of arguments as the
     ## presence of a default account can change the expected number of arguments
@@ -730,7 +775,7 @@ raise config_error if config_error
 
 class QSSApp
 
-def initialize(config:, account:, env:, instance:, auto_yes:, get_id_all:, group_by_region_opt:,
+def initialize(config:, account:, env:, instance:, auto_yes:, get_id_all:, get_id_json:, tunnel_spec:, exec_cmd:, group_by_region_opt:,
                std_script_name:, completion_dir_var:, completion_dirs:)
     @config              = config
     @account             = account
@@ -738,6 +783,9 @@ def initialize(config:, account:, env:, instance:, auto_yes:, get_id_all:, group
     @instance            = instance
     @auto_yes            = auto_yes
     @get_id_all          = get_id_all
+    @get_id_json         = get_id_json
+    @tunnel_spec         = tunnel_spec
+    @exec_cmd            = exec_cmd
     @group_by_region_opt = group_by_region_opt
     @std_script_name     = std_script_name
     @completion_dir_var  = completion_dir_var
@@ -1145,11 +1193,13 @@ end
 
 ################### Open a SSM session to the instance
 def connect
-    config   = @config
-    account  = @account
-    env      = @env
-    instance = @instance
-    auto_yes = @auto_yes
+    config      = @config
+    account     = @account
+    env         = @env
+    instance    = @instance
+    auto_yes    = @auto_yes
+    tunnel_spec = @tunnel_spec
+    exec_cmd    = @exec_cmd
 
     ## Load the database file
     begin
@@ -1244,29 +1294,67 @@ def connect
         end
         target_instance = eligible_instances[user_response.to_i]
     end
-    target_id = target_instance.instance_id
+    target_id   = target_instance.instance_id
     target_name = target_instance.tags.find{ |t| t.key == 'Name' }&.value || '<unnamed>'
-    target_az = target_instance.placement.availability_zone
+    target_az   = target_instance.placement.availability_zone
 
-    ## Prepare the connection command
+    ## Parse tunnel spec into individual ERB variables (nil for all when not in tunnel mode)
+    if tunnel_spec
+        tunnel_parts = tunnel_spec.split(':')
+        case tunnel_parts.size
+        when 2
+            tunnel_local_port, tunnel_remote_port = tunnel_parts
+            tunnel_remote_host = nil
+        when 3
+            tunnel_local_port, tunnel_remote_host, tunnel_remote_port = tunnel_parts
+        else
+            exit_on_error("Invalid -L value '#{tunnel_spec}': expected local_port:remote_port or local_port:remote_host:remote_port", 56)
+        end
+        exit_on_error("Invalid -L value: '#{tunnel_local_port}' is not a valid port number",  57) unless tunnel_local_port  =~ /^\d+$/
+        exit_on_error("Invalid -L value: '#{tunnel_remote_port}' is not a valid port number", 57) unless tunnel_remote_port =~ /^\d+$/
+
+        if tunnel_remote_host.nil?
+            tunnel_document   = 'AWS-StartPortForwardingSession'
+            tunnel_parameters = JSON.generate({'portNumber' => [tunnel_remote_port], 'localPortNumber' => [tunnel_local_port]})
+        else
+            tunnel_document   = 'AWS-StartPortForwardingSessionToRemoteHost'
+            tunnel_parameters = JSON.generate({'host' => [tunnel_remote_host], 'portNumber' => [tunnel_remote_port], 'localPortNumber' => [tunnel_local_port]})
+        end
+    else
+        tunnel_local_port = tunnel_remote_host = tunnel_remote_port = tunnel_document = tunnel_parameters = nil
+    end
+
+    ## Build the ERB variables – all tunnel_* are nil when not in tunnel mode
     erb_vars = {
-        account:       account,
-        profile:       config[:all_accounts][account]['aws_profile'],
-        region:        target_az[0..-2],
-        az:            target_az,
-        env:           env,
-        short_name:    instance,
-        instance_id:   target_id,
-        instance_name: target_name,
-        ec2_instance:  target_instance,
+        account:            account,
+        profile:            config[:all_accounts][account]['aws_profile'],
+        region:             target_az[0..-2],
+        az:                 target_az,
+        env:                env,
+        short_name:         instance,
+        instance_id:        target_id,
+        instance_name:      target_name,
+        ec2_instance:       target_instance,
+        tunnel_spec:        tunnel_spec,
+        tunnel_local_port:  tunnel_local_port,
+        tunnel_remote_host: tunnel_remote_host,
+        tunnel_remote_port: tunnel_remote_port,
+        tunnel_document:    tunnel_document,
+        tunnel_parameters:  tunnel_parameters,
+        exec_cmd:           exec_cmd,
     }
 
-    ## Perform the ERB substitutions on the connect command
-    connect_command = config[:connect_command].map do |arg|
+    ## Select the command template based on the active mode
+    command_template = if tunnel_spec then config[:tunnel_command]
+                       elsif exec_cmd then config[:exec_command]
+                       else                config[:connect_command]
+                       end
+    connect_command = command_template.flat_map do |arg|
         begin
-            erb_eval(arg, erb_vars)
+            result = erb_eval(arg, erb_vars)
+            result.is_a?(Array) ? result : [result]
         rescue => error
-            $stderr.puts "ERROR - Failed to process argument '#{arg}' of the connect command: #{error}"
+            $stderr.puts "ERROR - Failed to process argument '#{arg}' of the command: #{error}"
             exit 54
         end
     end
@@ -1274,28 +1362,40 @@ def connect
     ## Process the environment variables
     connect_env_vars = config[:connect_env_vars].map do |var_name, var_value|
         begin
-            var_value = erb_eval(var_value, erb_vars)
+            val = erb_eval(var_value, erb_vars)
+            raise "connect_env_vars value for '#{var_name}' must be a string" if val.is_a?(Array)
+            [var_name, val]
         rescue => error
             $stderr.puts "ERROR - Failed to process environment variable '#{var_name}': #{error}"
             exit 55
         end
-        [var_name, var_value]
     end.to_h
 
-    ## Execute the connect command
-    puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S%z')} - Connecting to instance [#{target_id}] #{target_name} ..." if $verbose
-    puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S%z')} - Command: #{connect_command.join(' ')}" if $VERBOSE
+    if $verbose
+        ts = Time.now.strftime('%Y-%m-%d %H:%M:%S%z')
+        if tunnel_spec
+            dest = tunnel_remote_host ? "#{tunnel_remote_host}:#{tunnel_remote_port}" : "#{target_name}:#{tunnel_remote_port}"
+            puts "#{ts} - Tunnel: local:#{tunnel_local_port} -> #{dest} via [#{target_id}]"
+        elsif exec_cmd
+            puts "#{ts} - Executing on [#{target_id}] #{target_name}: #{exec_cmd}"
+        else
+            puts "#{ts} - Connecting to instance [#{target_id}] #{target_name} ..."
+        end
+        puts "#{ts} - Command: #{connect_command.join(' ')}" if $VERBOSE
+    end
+
     exec(connect_env_vars, *connect_command)
 end
 
 ################### Retrieve the EC2 instance ID
 def get_id
-    config     = @config
-    account    = @account
-    env        = @env
-    instance   = @instance
-    auto_yes   = @auto_yes
-    get_id_all = @get_id_all
+    config      = @config
+    account     = @account
+    env         = @env
+    instance    = @instance
+    auto_yes    = @auto_yes
+    get_id_all  = @get_id_all
+    get_id_json = @get_id_json
 
     ## Load the database file
     begin
@@ -1317,15 +1417,19 @@ def get_id
     ## Process fetched instances
     instance_table = []   ## columns: [number, instance_id, status, region/az, name]
     eligible_instances = {}
+    eligible_regions   = {}  ## region per eligible instance number (for JSON output)
+    all_instances_json = []  ## all instances regardless of state (for --json --all)
     eligible_instances_count = 0
     rejected_instances_count = 0
     instance_info.sort.each do |(_acc, region), (status, output)|
+        profile            = config[:all_accounts][account]['aws_profile']
         instance_candidates = db_accounts[account][region][env][instance].sort
 
         if status == :error
             $stderr.puts "#{account}/#{region}: ERROR - Could not fetch instance info: #{output}"
             instance_candidates.each do |inst_name|
                 instance_table << ['', '', 'ERROR', region, inst_name]
+                all_instances_json << {instance_id: nil, profile: profile, region: region, status: 'error'} if get_id_json && get_id_all
             end
             rejected_instances_count += instance_candidates.size
             next
@@ -1341,9 +1445,11 @@ def get_id
 
             instances_by_name[inst_name].sort_by(&:instance_id).each do |inst|
                 state = inst.state.name
+                all_instances_json << {instance_id: inst.instance_id, profile: profile, region: region, status: state} if get_id_json && get_id_all
                 if state == 'running'
                     eligible_instances_count += 1
                     eligible_instances[eligible_instances_count] = inst
+                    eligible_regions[eligible_instances_count]   = region
                     inst_num = eligible_instances_count.to_s
                 else
                     rejected_instances_count += 1
@@ -1354,12 +1460,19 @@ def get_id
         end
     end
 
+    columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
+
+    ## --json --all: output all instances (any state) as a JSON array, no interactive prompt
+    if get_id_json && get_id_all
+        $stderr.puts "Found #{all_instances_json.size} instance(s):" if $verbose
+        puts all_instances_json.to_json
+        return
+    end
+
     if eligible_instances_count == 0
         $stderr.puts "\nERROR - No running instance found for '#{account} / #{env} / #{instance}'"
         exit 72
     end
-
-    columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
 
     if get_id_all
         ## Non-interactive mode: print all running instance IDs, one per line on stdout
@@ -1377,6 +1490,7 @@ def get_id
 
         if eligible_instances_count == 1
             target_instance = eligible_instances[1]
+            target_region   = eligible_regions[1]
             if rejected_instances_count > 0
                 $stderr.puts "\nThere is only one running instance [#{target_instance.instance_id}] but some others were not available"
                 exit 73 unless ask_for_yes_no("Is it the one whose ID you want to retrieve ?", auto_yes, output: $stderr)
@@ -1394,8 +1508,15 @@ def get_id
                 $stderr.puts "Invalid choice: '#{user_response}', please try again"
             end
             target_instance = eligible_instances[user_response.to_i]
+            target_region   = eligible_regions[user_response.to_i]
         end
-        puts target_instance.instance_id
+
+        if get_id_json
+            profile = config[:all_accounts][account]['aws_profile']
+            puts({instance_id: target_instance.instance_id, profile: profile, region: target_region}.to_json)
+        else
+            puts target_instance.instance_id
+        end
     end
 end
 
@@ -1471,11 +1592,11 @@ _qss_completion() {
 
             # For each mode: [<max number of positional args>, <list of mode specific options>]
             mode_info_table = {
-                connect:            [3, opt_mode_table.keys],
+                connect:            [3, opt_mode_table.keys + ['--tunnel', '-L', '--exec', '-e']],
                 refresh:            [2, []],
                 list:               [2, ['--group_by_region', '-R', '--group_by_env', '-E']],
                 info:               [3, ['--group_by_region', '-R', '--group_by_env', '-E']],
-                get_id:             [3, ['--all', '-A']],
+                get_id:             [3, ['--all', '-A', '--json', '-j']],
                 install_completion: [0, []],
             }
 
@@ -1501,6 +1622,10 @@ _qss_completion() {
                             is_opt_value = :account
                         elsif arg == '--config'  || arg =~ /^-[a-zA-Z]*c$/
                             is_opt_value = :config
+                        elsif arg == '--tunnel' || arg == '-L'
+                            is_opt_value = :tunnel
+                        elsif arg == '--exec' || arg == '-e'
+                            is_opt_value = :exec
                         end
                         mode = opt_mode_table[arg] || arg[/^-([a-zA-Z]{2,})$/, 1]&.chars&.lazy&.map{ |c| opt_mode_table["-#{c}"] }&.find(&:itself) || mode
                         next
@@ -1680,6 +1805,9 @@ QSSApp.new(
     instance:            instance,
     auto_yes:            auto_yes,
     get_id_all:          get_id_all,
+    get_id_json:         get_id_json,
+    tunnel_spec:         tunnel_spec,
+    exec_cmd:            exec_cmd,
     group_by_region_opt: group_by_region_opt,
     std_script_name:     std_script_name,
     completion_dir_var:  completion_dir_var,
