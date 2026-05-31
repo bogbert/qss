@@ -1,4 +1,7 @@
 # QSS - Quick SSM Session
+**_A fast CLI for AWS SSM Session Manager — connect, tunnel, and run commands on EC2 instances without memorizing instance IDs, regions, or profiles._**
+
+---
 
 ## tl;dr
 
