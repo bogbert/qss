@@ -79,7 +79,7 @@ def usage(rc = 0)
 
     output.puts %Q{\
 .
-. QSS - Quick SSM Session v1.1.0
+. QSS - Quick SSM Session v1.1.1
 . Usage: #{me} [options] <account> <env name> <instance short name>
 .        #{me} --refresh [options] [<account> [<env name>]]
 .        #{me} --list    [options] [<account> [<env name>]]
@@ -101,7 +101,7 @@ def usage(rc = 0)
 .   -i, --info            Display information about instances
 .   -g, --get-id          Retrieve the EC2 instance ID
 .   -A, --all             Return all matching IDs without prompting (use with --get-id)
-.   -j, --json            Output result as JSON: {instance_id, profile, region} (or array with status when combined with --all)
+.   -j, --json            Output result as JSON for --get-id: {instance_id, profile, region} (or array if combined with --all)
 .   -L, --tunnel          Open a port-forwarding tunnel (format: local_port:remote_port or local_port:remote_host:remote_port)
 .   -e, --exec            Execute a command on the instance interactively (cannot be combined with --tunnel)
 .   -R, --group_by_region Group instances by account/region/env (use with --list and --info)
@@ -459,7 +459,7 @@ def erb_eval(template, variables = {})
   ## For templates that are purely a single expression (<%= expr %>),
   ## return the raw Ruby value so that Array results can be flat-mapped
   ## into connect_command without going through Array#to_s.
-  if (m = template.match(/\A\s*<%=\s*(.*?)\s*-?%>\s*\z/m))
+  if (m = template.match(/\A\s*<%=\s*((?:[^%]|%(?!>))*)\s*-?%>\s*\z/m))
     result = b.eval(m[1])
     return result if result.is_a?(Array)
     return result.nil? ? '' : result.to_s
