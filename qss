@@ -79,7 +79,7 @@ def usage(rc = 0)
 
     output.puts %Q{\
 .
-. QSS - Quick SSM Session v1.1.1
+. QSS - Quick SSM Session v1.1.2
 . Usage: #{me} [options] <account> <env name> <instance short name>
 .        #{me} --refresh [options] [<account> [<env name>]]
 .        #{me} --list    [options] [<account> [<env name>]]
@@ -1169,7 +1169,7 @@ def info
                                 puts "#{inst_indent_str}  Type:  #{inst.instance_type}"
                                 puts "#{inst_indent_str}  AZ:    #{inst.placement.availability_zone}"
                                 puts "#{inst_indent_str}  AMI:   #{inst.image_id}"
-                                puts "#{inst_indent_str}  Launch Time: #{inst.launch_time.strftime('%Y-%m-%d %H:%M:%S%z')}"
+                                puts "#{inst_indent_str}  Launch Time: #{inst.launch_time.localtime.strftime('%Y-%m-%d %H:%M:%S%z')}"
                                 puts "#{inst_indent_str}  Public DNS:  #{default(inst.public_dns_name, '<none>')}"
                                 puts "#{inst_indent_str}  Private DNS: #{default(inst.private_dns_name, '<none>')}"
                                 puts "#{inst_indent_str}  Public IP:   #{default(inst.public_ip_address, '<none>')}"
@@ -1219,7 +1219,7 @@ def connect
     instance_info = fetch_ec2_inst_from_db_accounts(db_accounts, config, MAX_THREAD_NUM)
 
     ## Process fetched instances
-    instance_table = []   ## columns: [number, intance_id, status, region, name]
+    instance_table = []   ## columns: [number, intance_id, status, region, launch time, name]
     eligible_instances = {}
     eligible_instances_count = 0
     rejected_instances_count = 0
@@ -1230,7 +1230,7 @@ def connect
         if status == :error
             $stderr.puts "#{account}/#{region}: ERROR - Could not fetch instance info: #{output}"
             instance_candidates.each do |inst_name|
-                instance_table << ['', '', 'ERROR', region, inst_name]
+                instance_table << ['', '', 'ERROR', region, '', inst_name]
             end
             rejected_instances_count += instance_candidates.size
             next
@@ -1241,7 +1241,7 @@ def connect
         instance_candidates.each do |inst_name|
             if instances_by_name[inst_name].nil?
                 rejected_instances_count += 1
-                instance_table << ['', '', 'NOT FOUND', region, inst_name]
+                instance_table << ['', '', 'NOT FOUND', region, '', inst_name]
                 next
             end
 
@@ -1255,7 +1255,7 @@ def connect
                     rejected_instances_count += 1
                     inst_num = ''
                 end
-                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst_name]
+                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst.launch_time.localtime.strftime('%Y-%m-%d %H:%M:%S%z'), inst_name]
             end
         end
     end
@@ -1263,7 +1263,7 @@ def connect
     if $verbose || eligible_instances_count > 1 || rejected_instances_count > 0
         ## Display the instance table
         puts "Found #{eligible_instances_count} running instance(s):"
-        columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
+        columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['LAUNCH TIME', 25], ['NAME', 80]]
         display_table(instance_table, columns)
     end
 
@@ -1415,7 +1415,7 @@ def get_id
     instance_info = fetch_ec2_inst_from_db_accounts(db_accounts, config, MAX_THREAD_NUM)
 
     ## Process fetched instances
-    instance_table = []   ## columns: [number, instance_id, status, region/az, name]
+    instance_table = []   ## columns: [number, instance_id, status, region/az, launch time, name]
     eligible_instances = {}
     eligible_regions   = {}  ## region per eligible instance number (for JSON output)
     all_instances_json = []  ## all instances regardless of state (for --json --all)
@@ -1428,7 +1428,7 @@ def get_id
         if status == :error
             $stderr.puts "#{account}/#{region}: ERROR - Could not fetch instance info: #{output}"
             instance_candidates.each do |inst_name|
-                instance_table << ['', '', 'ERROR', region, inst_name]
+                instance_table << ['', '', 'ERROR', region, '', inst_name]
                 all_instances_json << {instance_id: nil, profile: profile, region: region, status: 'error'} if get_id_json && get_id_all
             end
             rejected_instances_count += instance_candidates.size
@@ -1439,7 +1439,7 @@ def get_id
         instance_candidates.each do |inst_name|
             if instances_by_name[inst_name].nil?
                 rejected_instances_count += 1
-                instance_table << ['', '', 'NOT FOUND', region, inst_name]
+                instance_table << ['', '', 'NOT FOUND', region, '', inst_name]
                 next
             end
 
@@ -1455,12 +1455,12 @@ def get_id
                     rejected_instances_count += 1
                     inst_num = ''
                 end
-                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst_name]
+                instance_table << [inst_num, inst.instance_id, state, inst.placement.availability_zone, inst.launch_time.localtime.strftime('%Y-%m-%d %H:%M:%S%z'), inst_name]
             end
         end
     end
 
-    columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['NAME', 80]]
+    columns = [['#', 4], ['INSTANCE ID', 20], ['STATUS', 20], ['REGION / AZ', 20], ['LAUNCH TIME', 25], ['NAME', 80]]
 
     ## --json --all: output all instances (any state) as a JSON array, no interactive prompt
     if get_id_json && get_id_all
