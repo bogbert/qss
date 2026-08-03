@@ -501,9 +501,12 @@ end
 
 ##########################################################################
 
-## Recursive function to build a table from a hash, meant to be used with display_hash_as_table
-## The function builds a table of a given number of columns from a nested hash
-## Arrays are supported but each element of the array is considered a final cell value (no array nesting)
+## Recursive function to build a table from a hash, meant to be used with display_table
+## data is a nested hash; its nesting depth must be >= col_number
+## Arrays are supported at the last level but each element is treated as a final cell value (no array nesting)
+## Example: {'reg-a' => {'prod' => {'db' => nil, 'web' => nil}}, 'reg-b' => {'staging' => {'db' => nil}}}
+##   with col_number=3 produces [['reg-a', 'prod', 'db'], ['', '', 'web'], ['reg-b', 'staging', 'db']]
+##   (parent values are replaced by '' for sibling rows, to avoid repetition in the rendered table)
 ## Call it like that:
 ## table = hash_to_table(data, column_number)
 ## Notice that for an empty hash, the resulting table will contain one empty row
@@ -536,9 +539,7 @@ end
 
 ##########################################################################
 
-## data is a hash, containing nested hashes, the depth of the nesting
-## has to be bigger or equal to the number of columns
-## For the last column, arrays are accepted instead of hashes
+## table is an array of rows, each row being an array of cell values
 ## columns format: [[<column name>, <column max width>], ...]
 def display_table(table, columns, col_separator = ' | ', output: $stdout)
     ## Extract column names and widths
